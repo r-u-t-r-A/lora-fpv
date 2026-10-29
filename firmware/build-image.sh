@@ -281,6 +281,10 @@ for r in $roles; do
     rm -rf "$dst" && mkdir -p "$dst"
     cp -a "$sdk"/output/image/. "$dst"/
     cp "$work/overlay-olv/etc/olv-build" "$dst/olv-build.txt"
+    # Partition table for firmware/flash.sh (SD cards are written partition
+    # by partition at these offsets).
+    sed -n 's/^export RK_PARTITION_CMD_IN_ENV="\(.*\)"/\1/p' "$cfgdir/$olv_cfg" >"$dst/partitions.txt"
+    echo "$medium" >"$dst/medium.txt"
     echo "  -> $dst"
 done
 
@@ -288,9 +292,9 @@ step "done"
 for r in $roles; do echo "  $out/pico-mini-$medium-$r"; done
 cat <<EOF
 
-Flashing: see firmware/README.md. In short:
-  SPI NAND (Pico Mini B): hold BOOT, plug USB (maskrom), then
-      sudo $sdk/tools/linux/Linux_Upgrade_Tool/upgrade_tool uf <image dir>/update.img
-  SD card (Pico Mini A): write the image dir to the card with the SDK's
-      blkenvflash script or Rockchip SocToolKit (README).
+Flash (firmware/README.md, section 3):
+  SPI NAND (Pico Mini B): hold BOOT while plugging in USB, then
+      firmware/flash.sh --sdk $sdk $out/pico-mini-$medium-<role>
+  SD card (Pico Mini A):
+      firmware/flash.sh $out/pico-mini-$medium-<role> --sd /dev/sdX
 EOF
