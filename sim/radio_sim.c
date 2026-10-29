@@ -5,6 +5,17 @@
 // the receiver's loss model drops it. Lets the real air/ and vrx/ programs
 // run against each other on one PC, in real time.
 //
+// The chip in radio_pins.chip is emulated as far as the link sees it:
+// settings it cannot do are refused (radio_check), its maximum packet length
+// applies to TX and RX, and a receiver only hears packets sent with the same
+// FLRC bit rate and coding rate.
+//
+// Timing: all processes share CLOCK_MONOTONIC, so each datagram carries its
+// TX start time and the RX-done time is that plus the airtime, however late
+// the receiving process gets to read it (like the kernel timestamp of the
+// IRQ edge on hardware). A receiver hears a packet only if it was already
+// listening on that frequency when the packet started.
+//
 // Environment:
 //   OLV_SIM_ETHER    group:port (default 239.255.77.1:47999)
 //   OLV_SIM_CHANNEL  receiver loss model, sim/channel.h syntax (default none)
@@ -30,7 +41,7 @@
 #include "radio.h"
 
 #define WIRE_MAGIC 0x4F4C5645u // "OLVE"
-#define WIRE_HDR 20
+#define WIRE_HDR 32
 #define PENDING 64
 
 enum smode { S_STBY, S_RX, S_TX };
@@ -49,11 +60,14 @@ struct radio {
     uint32_t freq;
     enum smode mode;
     struct flrc_phy phy;
+    const struct radio_caps *caps;
+    struct radio_pins pins;
     struct channel_model ch;
     bool lossy;
     int16_t rssi;
     bool tx_pending;
     uint32_t tx_done_us;
+    uint32_t listen_us; // since when in RX on the current frequency
     struct pending q[PENDING];
     int nq;
     double t0;
@@ -79,7 +93,11 @@ static uint8_t chan_of(uint32_t hz) {
 }
 
 struct radio *radio_open(const struct radio_pins *pins, const struct radio_flrc *f) {
-    (void)pins;
+    const char *err = radio_check(pins, f);
+    if (err) {
+        fprintf(stderr, "radio_sim: %s\n", err);
+        return NULL;
+    }
     struct radio *r = calloc(1, sizeof(*r));
     if (!r)
         return NULL;
@@ -120,6 +138,8 @@ struct radio *radio_open(const struct radio_pins *pins, const struct radio_flrc 
     r->id = olv_xorshift32(&seed) | 1;
     r->freq = f->freq_hz;
     r->phy = flrc_phy_default(f->bitrate_bps, f->cr);
+    r->caps = radio_chip_caps(pins->chip);
+    r->pins = *pins;
     const char *chs = getenv("OLV_SIM_CHANNEL");
     if (chs && *chs) {
         if (channel_parse(&r->ch, chs)) {
@@ -132,7 +152,7 @@ struct radio *radio_open(const struct radio_pins *pins, const struct radio_flrc 
     const char *rs = getenv("OLV_SIM_RSSI");
     r->rssi = (int16_t)(rs ? atoi(rs) : -80);
     r->t0 = radio_now_us() / 1e6;
-    fprintf(stderr, "radio_sim: ether %s:%d, id %08x%s%s\n", ether, port, r->id,
+    fprintf(stderr, "radio_sim: %s, ether %s:%d, id %08x%s%s\n", r->caps->name, ether, port, r->id,
             r->lossy ? ", loss " : "", r->lossy ? chs : "");
     return r;
 }
@@ -145,8 +165,13 @@ void radio_close(struct radio *r) {
 }
 
 int radio_set_freq(struct radio *r, uint32_t hz) {
+    if (!radio_caps_freq_ok(r->caps, hz)) {
+        fprintf(stderr, "radio_sim: %s cannot tune to %.3f MHz\n", r->caps->name, hz / 1e6);
+        return -1;
+    }
     r->freq = hz;
     r->nq = 0; // anything in flight on the old channel is lost
+    r->listen_us = radio_now_us();
     return 0;
 }
 
@@ -155,13 +180,22 @@ int radio_calibrate(struct radio *r, uint32_t hz) {
 }
 
 int radio_set_power(struct radio *r, int8_t dbm) {
-    (void)r;
-    (void)dbm;
+    const char *err = radio_check_power(&r->pins, r->freq, dbm);
+    if (err)
+        fprintf(stderr, "radio_sim: %s\n", err);
+    return err ? -1 : 0;
+}
+
+int radio_set_modulation(struct radio *r, uint32_t bitrate_bps, uint8_t cr) {
+    if (!radio_caps_bitrate_ok(r->caps, bitrate_bps) || cr > 7 || !(r->caps->cr_mask & (1u << cr)))
+        return -1;
+    r->phy = flrc_phy_default(bitrate_bps, cr);
+    r->nq = 0;
     return 0;
 }
 
 int radio_tx(struct radio *r, const uint8_t *buf, size_t len) {
-    if (len > OTA_MAX_PACKET || r->tx_pending)
+    if (len > r->caps->max_packet || r->tx_pending)
         return -1;
     uint8_t w[WIRE_HDR + OTA_MAX_PACKET];
     uint32_t now = radio_now_us(), air = flrc_airtime_us(&r->phy, len);
@@ -170,6 +204,9 @@ int radio_tx(struct radio *r, const uint8_t *buf, size_t len) {
     olv_put_u32(w + 8, r->freq);
     olv_put_u32(w + 12, air);
     olv_put_u32(w + 16, (uint32_t)len);
+    olv_put_u32(w + 20, r->phy.bitrate_bps);
+    olv_put_u32(w + 24, r->phy.cr);
+    olv_put_u32(w + 28, now);
     memcpy(w + WIRE_HDR, buf, len);
     if (sendto(r->sock, w, WIRE_HDR + len, 0, (struct sockaddr *)&r->group, sizeof(r->group)) < 0)
         return -1;
@@ -180,6 +217,8 @@ int radio_tx(struct radio *r, const uint8_t *buf, size_t len) {
 }
 
 int radio_rx(struct radio *r) {
+    if (r->mode != S_RX)
+        r->listen_us = radio_now_us();
     r->mode = S_RX;
     return 0;
 }
@@ -200,13 +239,18 @@ static void drain(struct radio *r) {
         if (olv_get_u32(w) != WIRE_MAGIC || olv_get_u32(w + 4) == r->id)
             continue;
         uint32_t freq = olv_get_u32(w + 8), air = olv_get_u32(w + 12);
-        uint32_t len = olv_get_u32(w + 16);
+        uint32_t len = olv_get_u32(w + 16), t_tx = olv_get_u32(w + 28);
         if (len > OTA_MAX_PACKET || (size_t)n < WIRE_HDR + len)
             continue;
-        if (r->mode != S_RX || freq != r->freq || r->nq == PENDING)
+        // Different modulation: not even a sync word match. Longer than
+        // this chip's FLRC limit: dropped by its length filter.
+        if (r->mode != S_RX || freq != r->freq || r->nq == PENDING ||
+            tdiff(t_tx, r->listen_us) < 0 || // tuned in after the preamble
+            olv_get_u32(w + 20) != r->phy.bitrate_bps || olv_get_u32(w + 24) != r->phy.cr ||
+            len > r->caps->max_packet)
             continue;
         struct pending *p = &r->q[r->nq++];
-        p->done_us = radio_now_us() + air;
+        p->done_us = t_tx + air;
         p->freq = freq;
         p->len = (uint16_t)len;
         memcpy(p->data, w + WIRE_HDR, len);

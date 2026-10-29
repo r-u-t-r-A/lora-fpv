@@ -37,4 +37,20 @@ if(FFMPEG AND Python3_FOUND)
         set_tests_properties(m1_link_${mode} PROPERTIES FIXTURES_REQUIRED lr_clip LABELS sim
                                                         TIMEOUT 60)
     endforeach()
+    # 2.4 GHz-only links. E28 (SX1280): 127-byte packets, VRX on mode=auto,
+    # which on that chip can only be hq1300.
+    add_test(NAME m1_link_e28
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/m1_link.py
+                     ${CMAKE_BINARY_DIR} ${CMAKE_BINARY_DIR}/m2_lr520/reference.ivf
+                     --mode hq1300 --loss 0.1 --seconds 3 --radio module=e28-2g4m27s
+                     --vrx-mode auto)
+    # LR2021 VRX told band=2400, mode=auto: scans hq2600 and hq1300. Worst
+    # case one wasted hq2600 park (41 hops) plus acquisition (79 hops).
+    add_test(NAME m1_scan_2g4
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/m1_link.py
+                     ${CMAKE_BINARY_DIR} ${CMAKE_BINARY_DIR}/m2_lr520/reference.ivf
+                     --mode hq1300 --loss 0.1 --seconds 4 --vrx-mode auto --vrx-band 2400
+                     --lock-limit-ms 2000)
+    set_tests_properties(m1_link_e28 m1_scan_2g4 PROPERTIES FIXTURES_REQUIRED lr_clip LABELS sim
+                                                            TIMEOUT 60)
 endif()

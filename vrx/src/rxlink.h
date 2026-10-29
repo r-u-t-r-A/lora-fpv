@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // VRX receive path: radio + hop synchronisation (common/fhss) + per-channel
 // statistics; good packets become VRX_REC_RX_PACKET records for the GUI.
+// With more than one candidate mode (vrx.conf mode=auto), each park timeout
+// without a beacon moves on to the next mode (band, bit rate, coding rate),
+// so the VRX finds whatever the air unit is sending.
 #ifndef OLV_RXLINK_H
 #define OLV_RXLINK_H
 
@@ -22,11 +25,20 @@ struct rxlink_ch {
     uint32_t crc;     // CRC failures
 };
 
+#define RXLINK_MAX_MODES 4
+
 typedef void (*rxlink_emit_cb)(void *ctx, const uint8_t *msg, size_t len);
 
 struct rxlink {
     struct radio *r;
-    const struct olv_mode *mode;
+    const struct olv_mode *mode; // current
+    const struct olv_mode *modes[RXLINK_MAX_MODES];
+    size_t n_modes, cur;
+    uint8_t cr_override; // 0 = each mode's default
+    uint32_t seed;
+    uint32_t park_timeouts_seen;
+    uint32_t mode_switches;
+    const struct olv_mode *stats_mode; // mode the per-channel table belongs to
     struct flrc_phy phy;
     struct fhss_rx sync;
     uint16_t link_id;
@@ -42,8 +54,9 @@ struct rxlink {
     FILE *capture; // optional vrxlog of everything received
 };
 
-int rxlink_open(struct rxlink *l, const struct olv_mode *mode, const char *bind,
-                const struct radio_pins *pins, struct radio_flrc *flrc);
+// Opens the radio on modes[0]; flrc->cr != 0 overrides every mode's coding rate.
+int rxlink_open(struct rxlink *l, const struct olv_mode *const *modes, size_t n_modes,
+                const char *bind, const struct radio_pins *pins, struct radio_flrc *flrc);
 void rxlink_close(struct rxlink *l);
 
 // Does radio work for at most max_wait_us. Complete WebSocket messages go to

@@ -60,7 +60,7 @@ async function main(): Promise<void> {
     log("no VRX found. Plug one in, or pass ?vrx=ws://127.0.0.1:8081/rx (see sim/fake_vrx.sh)");
   }
   const bind = params.get("bind") ?? config?.bind ?? "open-lr-video";
-  const fps = Number(params.get("fps")) || MODE_FPS[config?.mode ?? ""] || 30;
+  const fps = Number(params.get("fps")) || MODE_FPS[config?.active_mode ?? config?.mode ?? ""] || 30;
   log(`bind "${bind}" (link id ${linkId(bind)}), ${fps} fps, ${urls.length} VRX`);
 
   const reasm = await Reassembler.load(new URL("./olv.wasm", location.href).toString());

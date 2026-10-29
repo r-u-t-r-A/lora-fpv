@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // VRX daemon: receives OTA packets and streams them to the browser GUI.
 // Backends:
-//   --radio         receive with the radio (vrxd: LR2021, vrxd_sim: simulated
-//                   ether, see sim/radio_sim.c), hop sync, per-channel stats
+//   --radio         receive with the radio (vrxd: LR2021 or SX1280 as set in
+//                   the radio conf, vrxd_sim: simulated ether, see
+//                   sim/radio_sim.c), hop sync, mode scan, per-channel stats
 //   --replay FILE   play a sim/loopback packet log in real time (laptop GUI work)
 #define _POSIX_C_SOURCE 200809L
 
@@ -26,8 +27,8 @@
 
 struct vrx_conf {
     int id;
-    char band[8];  // "868" or "2400"
-    char mode[16]; // lr520 lr260 hq2600 hq1300
+    char band[8];  // "auto", "868" or "2400": which bands mode=auto scans
+    char mode[16]; // "auto" (scan), lr520 lr260 hq2600 hq1300
     char bind[64];
 };
 
@@ -67,8 +68,8 @@ static uint64_t now_us(void) {
 
 static void conf_defaults(struct vrx_conf *c) {
     c->id = 1;
-    snprintf(c->band, sizeof(c->band), "868");
-    snprintf(c->mode, sizeof(c->mode), "lr520");
+    snprintf(c->band, sizeof(c->band), "auto");
+    snprintf(c->mode, sizeof(c->mode), "auto");
     snprintf(c->bind, sizeof(c->bind), "open-lr-video");
 }
 
@@ -111,8 +112,7 @@ static int conf_save(const struct vrx_conf *c, const char *path) {
 }
 
 static bool valid_mode(const char *m) {
-    return !strcmp(m, "lr520") || !strcmp(m, "lr260") || !strcmp(m, "hq2600") ||
-           !strcmp(m, "hq1300");
+    return !strcmp(m, "auto") || olv_mode_find(m) != NULL;
 }
 
 // Extracts "key": "string" or "key": number from a flat JSON object.
@@ -182,8 +182,7 @@ static int api(void *ctx, const char *method, const char *path, const char *body
             conf_set(&c, "bind", v);
         if (json_get(body, "id", v, sizeof(v)))
             conf_set(&c, "id", v);
-        if (!valid_mode(c.mode) || (strcmp(c.band, "868") && strcmp(c.band, "2400")) || c.id < 1 ||
-            c.id > 254) {
+        if (!valid_mode(c.mode) || olv_band_parse(c.band) < 0 || c.id < 1 || c.id > 254) {
             snprintf(resp, cap, "{\"error\":\"invalid band, mode or id\"}");
             return 400;
         }
@@ -197,10 +196,11 @@ static int api(void *ctx, const char *method, const char *path, const char *body
     char bind[160];
     json_escape(d->conf.bind, bind, sizeof(bind));
     snprintf(resp, cap,
-             "{\"id\":%d,\"band\":\"%s\",\"mode\":\"%s\",\"bind\":\"%s\",\"link_id\":%u,"
-             "\"backend\":\"%s\",\"clients\":%u}",
-             d->conf.id, d->conf.band, d->conf.mode, bind, ota_link_id(d->conf.bind),
-             d->rp.data ? "replay" : "radio", httpd_ws_clients(d->http));
+             "{\"id\":%d,\"band\":\"%s\",\"mode\":\"%s\",\"active_mode\":\"%s\","
+             "\"bind\":\"%s\",\"link_id\":%u,\"backend\":\"%s\",\"clients\":%u}",
+             d->conf.id, d->conf.band, d->conf.mode, d->link ? d->link->mode->name : d->conf.mode,
+             bind, ota_link_id(d->conf.bind), d->rp.data ? "replay" : "radio",
+             httpd_ws_clients(d->http));
     return 200;
 }
 
@@ -281,6 +281,7 @@ static void send_status(struct vrxd *d, uint64_t now) {
     d->st.band = strcmp(d->conf.band, "2400") == 0;
     if (d->link) {
         const struct rxlink *l = d->link;
+        d->st.band = olv_mode_is_2g4(l->mode);
         d->st.sync_state = (uint8_t)l->sync.state;
         d->st.hop = l->sync.hop;
         d->st.cycle = l->sync.cycle;
@@ -386,14 +387,30 @@ int main(int argc, char **argv) {
     if (replay_path && replay_open(&d.rp, replay_path))
         return 1;
     if (use_radio) {
-        const struct olv_mode *mode = olv_mode_find(d.conf.mode);
         struct radio_pins pins;
         struct radio_flrc flrc;
-        if (!mode || radio_conf_load(radio_conf, &pins, &flrc) < 0)
+        int band = olv_band_parse(d.conf.band);
+        if (!valid_mode(d.conf.mode) || band < 0) {
+            fprintf(stderr, "vrxd: invalid band=%s / mode=%s\n", d.conf.band, d.conf.mode);
             return 2;
-        flrc.cr = 0; // the mode's default
-        if (rxlink_open(&link, mode, d.conf.bind, &pins, &flrc))
+        }
+        if (radio_conf_load(radio_conf, &pins, &flrc) < 0)
+            return 2;
+        const struct radio_caps *caps = radio_chip_caps(pins.chip);
+        const struct olv_mode *modes[RXLINK_MAX_MODES];
+        size_t n_modes = olv_modes_select(d.conf.mode, band, caps, modes, RXLINK_MAX_MODES);
+        if (n_modes == 0) {
+            fprintf(stderr, "vrxd: the %s cannot receive mode=%s in band=%s\n", caps->name,
+                    d.conf.mode, d.conf.band);
+            return 2;
+        }
+        flrc.cr = 0; // each mode's default
+        if (rxlink_open(&link, modes, n_modes, d.conf.bind, &pins, &flrc))
             return 1;
+        fprintf(stderr, "vrxd %d: %s, scanning", d.conf.id, caps->name);
+        for (size_t i = 0; i < n_modes; i++)
+            fprintf(stderr, " %s", modes[i]->name);
+        fprintf(stderr, "\n");
         if (capture) {
             link.capture = fopen(capture, "wb");
             if (!link.capture) {

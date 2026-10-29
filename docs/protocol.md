@@ -8,8 +8,12 @@ All multi-byte fields are little-endian. Implementations:
 
 ## 1. Over-the-air packet
 
-One LR2021 FLRC packet, hardware CRC on. A packet with a bad CRC is an erasure
-and is never passed up. Maximum packet: 255 bytes (design value; confirm in M0).
+One FLRC packet, hardware CRC on. A packet with a bad CRC is an erasure and
+is never passed up. Maximum packet: 255 bytes on the LR2021 (design value;
+confirm in M0), 127 bytes on the SX1280 (its FLRC payload limit). The air
+unit sizes packets to its chip's limit, or lower with `--max-packet`; a link
+with SX1280 receivers must stay at 127 bytes. Receivers accept any length up
+to their own limit, so nothing else in the format depends on the chip.
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
@@ -112,7 +116,13 @@ reported as lost.
 - PARKED: listen on one channel until a beacon arrives. Because each cycle is
   reshuffled, the gap between two uses of a channel is up to 2n - 1 hops, so
   the park timeout is 2n + 1 hops (LR 210 ms, HQ 810 ms). On timeout, move to
-  the next channel; the VRX alternates bands on repeated timeouts.
+  the next channel.
+- Mode scan: a VRX with `mode=auto` has a list of candidate modes (every
+  preset in its `band` filter, `auto`/`868`/`2400`, that its chip can run;
+  SX1280: hq1300 only). Each park timeout moves to the next candidate (bit
+  rate, coding rate, band) and restarts acquisition. Worst-case lock is the
+  sum of one park period per wrong candidate plus the acquisition time of
+  the right one (e.g. `band=2400` on an LR2021: 810 + 790 ms).
 - LOCKED: hop on the local clock; each beacon re-aligns it; any valid packet
   on the expected hop marks the hop as heard.
 - COASTING: after 3 consecutive hops with nothing heard, keep hopping for
@@ -134,6 +144,9 @@ Configuration uses `GET/POST /api/config` (JSON) on the same VRX.
 
 ## 5. Open issues
 
+- LR2021 and SX1280 FLRC have not been tested against each other on air
+  (sync word, CRC length, header). Until they are, keep one chip type per
+  link.
 - FLRC timing constants in `common/airtime.h` are guesses until M0.
 - Link capacity is below the CBR targets in CLAUDE.md (see
   `docs/reports/2026-10-29-sim-loopback.md`).

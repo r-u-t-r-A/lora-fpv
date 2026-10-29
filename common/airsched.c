@@ -9,12 +9,14 @@ void airsched_init(struct airsched *as, const struct airsched_cfg *cfg, uint64_t
     as->cfg = *cfg;
     if (as->cfg.queue_max == 0 || as->cfg.queue_max > AIRSCHED_QMAX)
         as->cfg.queue_max = AIRSCHED_QMAX;
+    if (as->cfg.max_packet == 0 || as->cfg.max_packet > OTA_MAX_PACKET)
+        as->cfg.max_packet = OTA_MAX_PACKET;
     fhss_seq_init(&as->seq, cfg->seed, cfg->n_channels);
     as->hop_start_us = now_us;
 }
 
 int airsched_enqueue(struct airsched *as, const uint8_t *pkt, size_t len) {
-    if (len < OTA_HDR_LEN || len > OTA_MAX_PACKET || as->q_count >= as->cfg.queue_max) {
+    if (len < OTA_HDR_LEN || len > as->cfg.max_packet || as->q_count >= as->cfg.queue_max) {
         as->st.dropped++;
         return -1;
     }
@@ -111,7 +113,8 @@ size_t airsched_best_packet(const struct airsched_cfg *c, unsigned *per_hop, uin
     size_t best_len = 0;
     uint64_t best_payload = 0;
     unsigned best_n = 0;
-    for (size_t len = OTA_HDR_LEN + 1; len <= OTA_MAX_PACKET; len++) {
+    size_t max = c->max_packet && c->max_packet < OTA_MAX_PACKET ? c->max_packet : OTA_MAX_PACKET;
+    for (size_t len = OTA_HDR_LEN + 1; len <= max; len++) {
         // The last packet of the hop needs no trailing gap.
         uint32_t one = flrc_airtime_us(&c->phy, len);
         if (one > avail)

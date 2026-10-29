@@ -20,22 +20,58 @@ static void tune(struct rxlink *l, uint8_t ch) {
     radio_rx(l->r);
 }
 
-int rxlink_open(struct rxlink *l, const struct olv_mode *mode, const char *bind,
-                const struct radio_pins *pins, struct radio_flrc *flrc) {
+static uint8_t mode_cr(const struct rxlink *l, const struct olv_mode *m) {
+    return l->cr_override ? l->cr_override : m->cr;
+}
+
+// Restarts hop acquisition for the current mode, keeping the lifetime counters.
+static void restart_sync(struct rxlink *l, uint32_t now) {
+    uint32_t locks = l->sync.locks, timeouts = l->sync.park_timeouts;
+    struct fhss_rx_cfg fc = fhss_rx_default_cfg(l->mode->band.n, 10000);
+    fhss_rx_init(&l->sync, l->seed, &fc, now);
+    l->sync.locks = locks;
+    l->sync.park_timeouts = timeouts;
+    l->park_timeouts_seen = timeouts;
+    l->counting = false;
+}
+
+// Next candidate mode: new modulation, calibration on its band, fresh sync.
+static void next_mode(struct rxlink *l, uint32_t now) {
+    l->cur = (l->cur + 1) % l->n_modes;
+    l->mode = l->modes[l->cur];
+    l->mode_switches++;
+    uint8_t cr = mode_cr(l, l->mode);
+    l->phy = flrc_phy_default(l->mode->bitrate_bps, cr);
+    radio_standby(l->r);
+    if (radio_set_modulation(l->r, l->mode->bitrate_bps, cr) ||
+        radio_calibrate(l->r, olv_band_center(&l->mode->band)))
+        l->radio_errors++;
+    restart_sync(l, now);
+    tune(l, fhss_rx_channel(&l->sync));
+}
+
+int rxlink_open(struct rxlink *l, const struct olv_mode *const *modes, size_t n_modes,
+                const char *bind, const struct radio_pins *pins, struct radio_flrc *flrc) {
     memset(l, 0, sizeof(*l));
-    l->mode = mode;
+    if (n_modes == 0)
+        return -1;
+    if (n_modes > RXLINK_MAX_MODES)
+        n_modes = RXLINK_MAX_MODES;
+    memcpy(l->modes, modes, n_modes * sizeof(*modes));
+    l->n_modes = n_modes;
+    l->mode = modes[0];
+    l->cr_override = flrc->cr;
     l->link_id = ota_link_id(bind);
-    flrc->freq_hz = olv_band_center(&mode->band);
-    flrc->bitrate_bps = mode->bitrate_bps;
-    if (!flrc->cr)
-        flrc->cr = mode->cr;
+    l->seed = fhss_seed(bind);
+    flrc->freq_hz = olv_band_center(&l->mode->band);
+    flrc->bitrate_bps = l->mode->bitrate_bps;
+    flrc->cr = mode_cr(l, l->mode);
     l->phy = flrc_phy_default(flrc->bitrate_bps, flrc->cr);
     l->r = radio_open(pins, flrc);
     if (!l->r)
         return -1;
     uint32_t now = radio_now_us();
-    struct fhss_rx_cfg fc = fhss_rx_default_cfg(mode->band.n, 10000);
-    fhss_rx_init(&l->sync, fhss_seed(bind), &fc, now);
+    restart_sync(l, now);
     l->start_us = now;
     tune(l, fhss_rx_channel(&l->sync));
     return 0;
@@ -73,6 +109,11 @@ static void on_packet(struct rxlink *l, const uint8_t *buf, size_t len,
         if (ota_beacon_unpack(buf + OTA_HDR_LEN, len - OTA_HDR_LEN, &b) == OTA_OK) {
             uint32_t hop_start = info->t_us - flrc_airtime_us(&l->phy, len) - b.offset_us;
             if (fhss_rx_on_beacon(&l->sync, b.cycle, h.hop, hop_start)) {
+                if (l->stats_mode != l->mode) { // first lock in this mode: new table
+                    memset(l->per_ch, 0, sizeof(l->per_ch));
+                    l->stats_mode = l->mode;
+                    pc->pkts = 1; // this beacon
+                }
                 pc->beacons++;
                 if (!l->first_lock_us)
                     l->first_lock_us = (uint64_t)(uint32_t)(info->t_us - l->start_us) + 1;
@@ -147,7 +188,10 @@ void rxlink_step(struct rxlink *l, uint32_t max_wait_us, rxlink_emit_cb emit, vo
     bool changed = false;
     uint8_t ch = fhss_rx_poll(&l->sync, now, &changed);
     count_hops(l);
-    if (changed)
+    if (l->n_modes > 1 && l->sync.state == FHSS_RX_PARKED &&
+        l->sync.park_timeouts != l->park_timeouts_seen)
+        next_mode(l, now); // a whole park period without a beacon: try the next mode
+    else if (changed)
         tune(l, ch);
     if (l->msg_len && tdiff(now, l->msg_t_us) >= 5000)
         flush(l, emit, ctx);
@@ -155,15 +199,17 @@ void rxlink_step(struct rxlink *l, uint32_t max_wait_us, rxlink_emit_cb emit, vo
 
 void rxlink_stats_json(const struct rxlink *l, char *out, size_t cap) {
     static const char *st[] = {"parked", "locked", "coasting"};
-    size_t n = (size_t)snprintf(out, cap,
-                                "{\"mode\":\"%s\",\"sync\":\"%s\",\"cycle\":%u,\"hop\":%u,"
-                                "\"locks\":%u,\"park_timeouts\":%u,\"first_lock_ms\":%.1f,"
-                                "\"pkts_ok\":%u,\"pkts_crc\":%u,\"foreign\":%u,\"radio_errors\":%u,"
-                                "\"channels\":[",
-                                l->mode->name, st[l->sync.state], l->sync.cycle, l->sync.hop,
-                                l->sync.locks, l->sync.park_timeouts,
-                                l->first_lock_us ? (double)(l->first_lock_us - 1) / 1000.0 : -1.0,
-                                l->pkts_ok, l->pkts_crc, l->pkts_foreign, l->radio_errors);
+    size_t n =
+        (size_t)snprintf(out, cap,
+                         "{\"mode\":\"%s\",\"modes\":%u,\"mode_switches\":%u,"
+                         "\"sync\":\"%s\",\"cycle\":%u,\"hop\":%u,"
+                         "\"locks\":%u,\"park_timeouts\":%u,\"first_lock_ms\":%.1f,"
+                         "\"pkts_ok\":%u,\"pkts_crc\":%u,\"foreign\":%u,\"radio_errors\":%u,"
+                         "\"channels\":[",
+                         l->mode->name, (unsigned)l->n_modes, l->mode_switches, st[l->sync.state],
+                         l->sync.cycle, l->sync.hop, l->sync.locks, l->sync.park_timeouts,
+                         l->first_lock_us ? (double)(l->first_lock_us - 1) / 1000.0 : -1.0,
+                         l->pkts_ok, l->pkts_crc, l->pkts_foreign, l->radio_errors);
     for (int c = 0; c < l->mode->band.n && n < cap; c++) {
         const struct rxlink_ch *p = &l->per_ch[c];
         double sent = (double)p->hops * l->mode->beacons_per_hop;

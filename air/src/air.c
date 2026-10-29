@@ -158,15 +158,17 @@ static void enqueue(void *ctx, const uint8_t *pkt, size_t len) {
 static void usage(void) {
     fprintf(stderr,
             "usage: air --source FILE.ivf|- [options]\n"
-            "  --mode lr520|lr260|hq2600|hq1300   (default lr520)\n"
+            "  --mode lr520|lr260|hq2600|hq1300   (default lr520; hq1300 on a 2.4 GHz-only chip)\n"
             "  --bind PHRASE        (default open-lr-video)\n"
             "  --fps N              frame rate of the source (default: mode)\n"
             "  --loop               loop an IVF source\n"
             "  --k N --n N          FEC shape (default 8/12)\n"
             "  --shard N            shard bytes (default: best fit per hop)\n"
+            "  --max-packet N       packet size limit (default: the chip's, 255 LR2021 / 127\n"
+            "                       SX1280; use 127 when SX1280 VRXs listen to an LR2021 air)\n"
             "  --cr N               FLRC coding rate (2=1/2 3=3/4 4=1 5=2/3; default: mode)\n"
             "  --radio-conf PATH    wiring (default " RADIO_CONF_PATH ")\n"
-            "  --power DBM          LR2021 output (default from radio conf, -9)\n"
+            "  --power DBM          chip output (default from radio conf, -9)\n"
             "  --outdoor            allow > 0 dBm\n"
             "  --rt                 SCHED_FIFO + mlockall\n"
             "  --seconds S          stop after S seconds\n");
@@ -174,8 +176,8 @@ static void usage(void) {
 
 int main(int argc, char **argv) {
     const char *src_path = NULL, *bind = "open-lr-video", *conf = RADIO_CONF_PATH;
-    const struct olv_mode *mode = olv_mode_find("lr520");
-    int fps = 0, k = 8, n = 12, shard = 0, cr = 0, power = 1000;
+    const struct olv_mode *mode = NULL;
+    int fps = 0, k = 8, n = 12, shard = 0, cr = 0, power = 1000, max_packet = 0;
     bool loop = false, outdoor = false, rt = false;
     double seconds = 0;
     enum {
@@ -192,16 +194,26 @@ int main(int argc, char **argv) {
         O_POWER,
         O_OUTDOOR,
         O_RT,
-        O_SEC
+        O_SEC,
+        O_MAXPKT
     };
-    static const struct option lo[] = {{"source", 1, 0, O_SRC},  {"mode", 1, 0, O_MODE},
-                                       {"bind", 1, 0, O_BIND},   {"fps", 1, 0, O_FPS},
-                                       {"loop", 0, 0, O_LOOP},   {"k", 1, 0, O_K},
-                                       {"n", 1, 0, O_N},         {"shard", 1, 0, O_SHARD},
-                                       {"cr", 1, 0, O_CR},       {"radio-conf", 1, 0, O_CONF},
-                                       {"power", 1, 0, O_POWER}, {"outdoor", 0, 0, O_OUTDOOR},
-                                       {"rt", 0, 0, O_RT},       {"seconds", 1, 0, O_SEC},
-                                       {"help", 0, 0, 'h'},      {0, 0, 0, 0}};
+    static const struct option lo[] = {{"source", 1, 0, O_SRC},
+                                       {"mode", 1, 0, O_MODE},
+                                       {"bind", 1, 0, O_BIND},
+                                       {"fps", 1, 0, O_FPS},
+                                       {"loop", 0, 0, O_LOOP},
+                                       {"k", 1, 0, O_K},
+                                       {"n", 1, 0, O_N},
+                                       {"shard", 1, 0, O_SHARD},
+                                       {"cr", 1, 0, O_CR},
+                                       {"radio-conf", 1, 0, O_CONF},
+                                       {"power", 1, 0, O_POWER},
+                                       {"outdoor", 0, 0, O_OUTDOOR},
+                                       {"rt", 0, 0, O_RT},
+                                       {"seconds", 1, 0, O_SEC},
+                                       {"max-packet", 1, 0, O_MAXPKT},
+                                       {"help", 0, 0, 'h'},
+                                       {0, 0, 0, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "h", lo, NULL)) != -1) {
         switch (c) {
@@ -250,6 +262,9 @@ int main(int argc, char **argv) {
         case O_SEC:
             seconds = atof(optarg);
             break;
+        case O_MAXPKT:
+            max_packet = atoi(optarg);
+            break;
         default:
             usage();
             return c == 'h' ? 0 : 2;
@@ -259,19 +274,35 @@ int main(int argc, char **argv) {
         usage();
         return 2;
     }
-    if (!fps)
-        fps = mode->fps;
 
     struct radio_pins pins;
     struct radio_flrc flrc;
     if (radio_conf_load(conf, &pins, &flrc) < 0)
         return 2;
+    const struct radio_caps *caps = radio_chip_caps(pins.chip);
+    if (!mode)
+        mode = olv_mode_find(caps->sub_ghz ? "lr520" : "hq1300");
+    if (!olv_mode_supported(mode, caps)) {
+        fprintf(stderr, "the %s cannot run %s (%s, %u kbit/s)\n", caps->name, mode->name,
+                olv_mode_is_2g4(mode) ? "2.4 GHz" : "868 MHz", mode->bitrate_bps / 1000);
+        return 2;
+    }
+    if (max_packet <= 0 || max_packet > caps->max_packet)
+        max_packet = caps->max_packet;
+    if (!fps)
+        fps = mode->fps;
     if (power != 1000)
         flrc.power_dbm = (int8_t)power;
     if (flrc.power_dbm > 0 && !outdoor) {
         fprintf(stderr, "refusing %d dBm without --outdoor\n", flrc.power_dbm);
         return 2;
     }
+    int port_dbm = radio_conf_port_dbm(&pins, flrc.power_dbm);
+    if (!outdoor && port_dbm > 0)
+        fprintf(stderr,
+                "air: WARNING: ~%+d dBm at the antenna port even at this setting (PA gain %d dB); "
+                "on the bench use at least %d dB of attenuation\n",
+                port_dbm, pins.pa_gain_db, port_dbm + 40);
     flrc.freq_hz = olv_band_center(&mode->band);
     flrc.bitrate_bps = mode->bitrate_bps;
     flrc.cr = (uint8_t)(cr ? cr : mode->cr);
@@ -291,7 +322,8 @@ int main(int argc, char **argv) {
                               .fec_k = (uint8_t)k,
                               .fec_n = (uint8_t)n,
                               .tx_power = flrc.power_dbm,
-                              .queue_max = 256};
+                              .queue_max = 256,
+                              .max_packet = (uint16_t)max_packet};
     unsigned per_hop;
     uint32_t shard_bps;
     size_t best = airsched_best_packet(&sc, &per_hop, &shard_bps);
@@ -304,7 +336,7 @@ int main(int argc, char **argv) {
                              .max_shard = (uint16_t)shard,
                              .min_shard = (uint16_t)shard};
     struct vpkt_tx tx;
-    if (shard <= 0 || vpkt_tx_init(&tx, &tc)) {
+    if (shard <= 0 || shard + OTA_HDR_LEN > max_packet || vpkt_tx_init(&tx, &tc)) {
         fprintf(stderr, "invalid FEC/shard settings\n");
         return 2;
     }
@@ -322,10 +354,13 @@ int main(int argc, char **argv) {
         return 1;
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    printf("air: %s, bind \"%s\" (link %u), %u ch, shard %d B x %u/hop (%.0f kbit/s video at "
-           "RS %d/%d), %d fps, %d dBm\n",
-           mode->name, bind, link_id, mode->band.n, shard, per_hop, shard_bps / 1000.0 * k / n, k,
-           n, fps, flrc.power_dbm);
+    printf("air: %s on %s, bind \"%s\" (link %u), %u ch, shard %d B x %u/hop (%.0f kbit/s video "
+           "at RS %d/%d), %d fps, %d dBm",
+           mode->name, caps->name, bind, link_id, mode->band.n, shard, per_hop,
+           shard_bps / 1000.0 * k / n, k, n, fps, flrc.power_dbm);
+    if (pins.pa_gain_db)
+        printf(" (~%+d dBm at the antenna port)", radio_conf_port_dbm(&pins, flrc.power_dbm));
+    printf("\n");
 
     static uint8_t au[VPKT_MAX_FRAME], prep[VPKT_MAX_FRAME];
     struct h265_ps_cache ps = {0};

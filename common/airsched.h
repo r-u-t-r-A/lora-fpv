@@ -32,7 +32,8 @@ struct airsched_cfg {
     uint8_t mode;
     uint8_t fec_k, fec_n;
     int8_t tx_power;
-    uint16_t queue_max; // <= AIRSCHED_QMAX
+    uint16_t queue_max;  // <= AIRSCHED_QMAX
+    uint16_t max_packet; // radio's FLRC limit (radio_caps.max_packet); 0 = OTA_MAX_PACKET
 };
 
 struct airsched_stats {
@@ -77,7 +78,7 @@ struct airsched_action {
 // now_us + airtime_us + phy.tx_gap_us (the TX-done event).
 void airsched_next(struct airsched *as, uint64_t now_us, struct airsched_action *a);
 
-// Packet size (header included, <= OTA_MAX_PACKET) that carries the most
+// Packet size (header included, <= max_packet) that carries the most
 // payload per hop given the beacon, retune time and per-packet gap. Writes
 // packets per hop and payload bits per second if the pointers are non-NULL.
 size_t airsched_best_packet(const struct airsched_cfg *cfg, unsigned *per_hop, uint32_t *bps);

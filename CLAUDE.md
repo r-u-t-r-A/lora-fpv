@@ -24,7 +24,8 @@ MAVLink OSD.
 ## Fixed decisions (do not reopen without asking the user)
 
 - Two modes only, both FLRC, both up to 1 W (the user holds licences for 1 W
-  on 868 MHz and 2.4 GHz):
+  on 868 MHz and 2.4 GHz). A 2.4 GHz-only build is also supported
+  (changed 2026-10-29): see "Radio chips" below.
   - **HQ**: 2.4 GHz, FLRC 2.6 or 1.3 Mbit/s, 1280x720, 60 fps / 30 fps.
   - **LR**: 868 MHz, FLRC 520 kbit/s (optional 260 kbit/s robust preset),
     640x360 to 848x480, 30 fps.
@@ -38,9 +39,21 @@ MAVLink OSD.
   in the Luckfox userspace apps. (Changed 2026-10-29; the Pico 2 modem from the
   design doc is dropped.)
 - Radio access goes through the C interface `common/radio.h`. Hardware
-  backend: `radio/` = RadioLib 7.8.1 (`LR2021` class, `beginFLRC`, submodule
-  pinned to the release tag) with `radio/linux_hal.cpp` (spidev + GPIO
-  chardev; IRQ edges polled with kernel timestamps, no callback threads).
+  backend: `radio/` = RadioLib 7.8.1 (submodule pinned to the release tag)
+  with `radio/linux_hal.cpp` (spidev + GPIO chardev; IRQ edges polled with
+  kernel timestamps, no callback threads); the chip is picked at run time
+  from `/etc/olv-radio.conf` (`chip=` or `module=`).
+- Radio chips (added 2026-10-29):
+  - **LR2021** (`LR2021` class, NiceRF LoRa2021F33-2G4): both bands, all
+    four modes, 255-byte packets.
+  - **SX1280** (`SX1280` class, Ebyte E28-2G4M27S, preset
+    `module=e28-2g4m27s`): 2.4 GHz only, FLRC up to 1.3 Mbit/s, so **hq1300
+    only**; FLRC payload max 127 bytes (~14 % less video capacity); PA/LNA
+    switched by the host on TXEN/RXEN; PA ~25 dB, LNA ~12 dB (from the
+    ExpressLRS E28 target, to be measured).
+  - Chip limits live in `common/radio_caps.c`; air, VRX and sim check modes
+    against them. Do not mix LR2021 and SX1280 in one link until their FLRC
+    interop is tested on the bench.
   `sim/` drives `common/` in virtual time and needs no radio.
 - Air and VRX Linux software: C11 on the luckfox-pico SDK (Buildroot, uClibc,
   toolchain `arm-rockchip830-linux-uclibcgnueabihf`), Rockchip MPI (rockit) for
@@ -58,7 +71,7 @@ MAVLink OSD.
 ```
 common/          shared C: ota.h, vrx_proto.h, fhss, fec, h265, vpkt (packetizer/reassembler), radio.h
 third_party/     zfex (vendored), RadioLib (git submodule), libde265 (submodule)
-radio/           LR2021 backend for the RV1103: RadioLib + Linux spidev/gpiod HAL (C++ shim)
+radio/           LR2021 + SX1280 backends for the RV1103: RadioLib + Linux spidev/GPIO HAL (C++ shim)
 air/             air-unit app for RV1103: capture -> encode -> slice -> FEC -> hop clock -> radio
 vrx/             VRX daemon for RV1103: radio + RX hop sync -> WebSocket; static HTTP; config REST; usb-gadget scripts
 web/             Chrome GUI (TypeScript + WASM FEC + WebCodecs + OSD)
@@ -78,9 +91,10 @@ for host builds).
 
 ### Over-the-air packet (one LR2021 FLRC packet)
 
-Max payload per packet: 255 bytes total (RadioLib's
-RADIOLIB_LR2021_MAX_PACKET_LENGTH; still check the datasheet in M0), header 12
-bytes, little-endian, packed:
+Max payload per packet: 255 bytes total on the LR2021 (RadioLib's
+RADIOLIB_LR2021_MAX_PACKET_LENGTH; still check the datasheet in M0), 127 on
+the SX1280; the air sizes packets to its chip (`--max-packet` to go lower).
+Header 12 bytes, little-endian, packed:
 
 ```c
 struct ota_hdr {
@@ -127,18 +141,20 @@ Hardware CRC on. A packet with a bad CRC is an erasure, never passed up.
 - RX acquisition: park on one channel until a beacon arrives (cycles are
   reshuffled, so worst case 2n-1 hops: 190 ms LR, 790 ms HQ), take cycle and
   hop from it, start the local timer. After 3
-  missed hops, coast on the local clock for 1 s, then re-park. On loss of
-  lock the VRX alternates parking between the two bands to find the mode.
+  missed hops, coast on the local clock for 1 s, then re-park. With
+  `mode=auto` in `/etc/vrx.conf` the VRX moves to the next candidate mode
+  after each park timeout; `band=2400` (or `868`) restricts the scan to one
+  band, and the chip's limits restrict it further (SX1280: hq1300 only).
 - `common/fhss.c` is shared by the air, VRX and host code and must have unit tests
   proving air and ground generate identical sequences.
 
 ### Luckfox <-> LR2021
 
-The RV1103 is SPI master to the LR2021 (`spidev`, up to the LR2021 SPI limit;
-measure what is reliable on the wiring). GPIOs: BUSY (input), IRQ/DIO
-(input, edge events via libgpiod; the kernel event timestamp is the RX/TX done
-time), NRESET (output), plus whatever enables the NiceRF module needs for its
-PA/LNA (check the module datasheet). Hop timing runs in userspace on Linux:
+The RV1103 is SPI master to the LR2021 or SX1280 (`spidev`, up to the chip's
+SPI limit; measure what is reliable on the wiring). GPIOs: BUSY (input),
+IRQ (LR2021 DIO5 / SX1280 DIO1; input, edge events via the GPIO chardev; the
+kernel event timestamp is the RX/TX done time), NRESET (output), plus the
+module's PA/LNA enables (NiceRF: per its datasheet; E28: TXEN, RXEN). Hop timing runs in userspace on Linux:
 measure retune time and timer jitter on the RV1103 early (M0/M1); if jitter is
 too large, use SCHED_FIFO + mlockall first; offloading the hop timer to the
 SoC's small MCU core (if the SDK exposes it) is a later option, not a plan.
@@ -215,7 +231,9 @@ control. If not, fall back to row refresh, then to short GOPs.
   test, write exact steps and ask the user to run them and paste the output.
 - RF safety on the bench: never transmit into a module with no antenna or
   load. Bench tests at 0 dBm or less, through 30 to 40 dB of attenuation.
-  1 W only outdoors with antennas fitted.
+  1 W only outdoors with antennas fitted. (The E28's minimum output is about
+  +7 dBm; until the user decides otherwise, its bench steps use >= 47 dB of
+  attenuation and the tools print the estimated port power.)
 - Prefer measuring over guessing: anything about LR2021 timing (retune time,
   max payload, TX/RX turnaround) gets a test in `tools/` and a number in
   `docs/`.

@@ -64,6 +64,7 @@ struct opts {
     int qpmin;
     int k, n, shard, min_shard;
     int cr;
+    int max_packet;
     int n_rx;
     const char *rx_spec[MAX_RX];
     bool mp4;
@@ -87,6 +88,7 @@ static void usage(void) {
             "  --shard N           shard payload bytes (default: best fit per hop)\n"
             "  --min-shard N       smaller blocks use fewer shards below this (default: shard)\n"
             "  --cr 2|3|4|5        FLRC coding rate 1/2, 3/4, 1, 2/3 (default: mode)\n"
+            "  --chip lr2021|sx1280  radio chip: packet limit 255 / 127 B (default lr2021)\n"
             "  --rx SPEC           add a receiver (repeatable, max %d); default two of\n"
             "                      'loss=0.2'. SPEC keys: loss=P burst=PGB/PBG burstloss=P\n"
             "                      bad=CH:P[+CH:P] outage=T0-T1 seed=N\n"
@@ -343,7 +345,8 @@ int main(int argc, char **argv) {
         O_GATE,
         O_GOOD,
         O_PIR,
-        O_MINSHARD
+        O_MINSHARD,
+        O_CHIP
     };
     static const struct option lo[] = {{"mode", 1, 0, O_MODE},
                                        {"input", 1, 0, O_INPUT},
@@ -365,6 +368,7 @@ int main(int argc, char **argv) {
                                        {"good-db", 1, 0, O_GOOD},
                                        {"pir", 0, 0, O_PIR},
                                        {"min-shard", 1, 0, O_MINSHARD},
+                                       {"chip", 1, 0, O_CHIP},
                                        {"help", 0, 0, 'h'},
                                        {0, 0, 0, 0}};
     int c;
@@ -437,6 +441,21 @@ int main(int argc, char **argv) {
         case O_MINSHARD:
             o.min_shard = atoi(optarg);
             break;
+        case O_CHIP: {
+            int chip = radio_chip_parse(optarg);
+            if (chip < 0) {
+                fprintf(stderr, "unknown chip %s\n", optarg);
+                return 2;
+            }
+            const struct radio_caps *rc = radio_chip_caps((enum radio_chip)chip);
+            if (!olv_mode_supported(o.mode, rc)) {
+                fprintf(stderr, "the %s cannot run %s (give --mode first)\n", rc->name,
+                        o.mode->name);
+                return 2;
+            }
+            o.max_packet = rc->max_packet;
+            break;
+        }
         case O_GOOD:
             o.good_db = atof(optarg);
             break;
@@ -480,6 +499,7 @@ int main(int argc, char **argv) {
                               .beacons_per_hop = o.mode->beacons_per_hop,
                               .seed = seed,
                               .n_channels = o.mode->band.n,
+                              .max_packet = (uint16_t)o.max_packet,
                               .link_id = link_id,
                               .mode = (uint8_t)o.mode->mode,
                               .fec_k = (uint8_t)o.k,
@@ -494,8 +514,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     int shard = o.shard ? o.shard : (int)(best_pkt - OTA_HDR_LEN);
-    if (shard < 1 || shard > OTA_MAX_PAYLOAD) {
-        fprintf(stderr, "shard must be 1..%d\n", OTA_MAX_PAYLOAD);
+    int max_shard = (o.max_packet ? o.max_packet : OTA_MAX_PACKET) - OTA_HDR_LEN;
+    if (shard < 1 || shard > max_shard) {
+        fprintf(stderr, "shard must be 1..%d\n", max_shard);
         return 2;
     }
     double video_cap_kbps = shard_bps / 1000.0 * o.k / o.n;

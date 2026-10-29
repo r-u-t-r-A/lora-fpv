@@ -75,8 +75,9 @@ export class VrxLink {
 
 export interface VrxConfig {
   id: number;
-  band: string;
-  mode: string;
+  band: string; // "auto" | "868" | "2400": bands the VRX scans
+  mode: string; // "auto" or a mode name
+  active_mode?: string; // mode the VRX is receiving (or trying) now
   bind: string;
   link_id: number;
 }

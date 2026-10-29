@@ -161,8 +161,36 @@ static void test_two_beacons_per_hop(void) {
     CHECK(late_second); // the second one never comes before mid-hop
 }
 
+// SX1280 links: the chip's 127-byte FLRC limit caps the packet size, and a
+// longer packet is refused at the queue rather than failing at the radio.
+static void test_max_packet(void) {
+    struct airsched_cfg c = cfg_for(1300000, 40);
+    c.beacons_per_hop = 2;
+    unsigned per_hop = 0;
+    CHECK(airsched_best_packet(&c, &per_hop, NULL) == OTA_MAX_PACKET - 8); // 247, unlimited
+    c.max_packet = 127;
+    size_t best = airsched_best_packet(&c, &per_hop, NULL);
+    CHECK(best == 127 && per_hop == 7);
+    airsched_init(&as, &c, 0);
+    uint8_t pkt[OTA_MAX_PACKET] = {0};
+    CHECK(airsched_enqueue(&as, pkt, 127) == 0);
+    CHECK(airsched_enqueue(&as, pkt, 128) == -1);
+    CHECK(as.st.dropped == 1);
+    struct airsched_action a;
+    uint64_t now = 0;
+    for (int i = 0; i < 40; i++) {
+        airsched_next(&as, now, &a);
+        if (a.send) {
+            CHECK(a.len <= 127);
+            now += a.airtime_us + c.phy.tx_gap_us;
+        } else
+            now = a.wake_us;
+    }
+}
+
 int main(void) {
     T_RUN(test_airtime);
+    T_RUN(test_max_packet);
     T_RUN(test_schedule_rules);
     T_RUN(test_queue_full);
     T_RUN(test_two_beacons_per_hop);
