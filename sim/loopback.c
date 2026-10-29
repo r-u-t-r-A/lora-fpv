@@ -771,5 +771,14 @@ int main(int argc, char **argv) {
 
     vpkt_tx_free(&tx);
     fec_free_cache();
+    for (int i = 0; i < ns; i++) {
+        free(streams[i]->rx);
+        free(streams[i]->state);
+    }
+    free(q_last);
+    free(latency_ms);
+    free(aus.p);
+    free(aus.len);
+    free(es);
     return (o.gate && !pass) ? 1 : 0;
 }
