@@ -10,13 +10,17 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        cc: [gcc, clang]
+        include:
+          - { cc: gcc, cxx: g++ }
+          - { cc: clang, cxx: clang++ }
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build ffmpeg
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DOLV_SANITIZE=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DOLV_SANITIZE=ON
       - name: Build
         run: ninja -C build
       - name: Test
@@ -38,7 +42,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build ffmpeg
       - name: Simulator capture for the WASM test
         run: |
-          cmake -S . -B build -G Ninja
+          cmake -S . -B build -G Ninja -DOLV_RADIO=OFF
           ninja -C build loopback
           ./build/sim/loopback --seconds 4 --out build/cap
       - name: Build WASM

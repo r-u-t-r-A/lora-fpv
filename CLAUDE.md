@@ -33,12 +33,15 @@ MAVLink OSD.
   Software fallback: libde265 compiled to WASM.
 - No microcontroller in between: the RV1103 drives the LR2021 directly over
   SPI (`spidev`) plus GPIOs (BUSY, IRQ, NRESET, any PA/RF-switch enables on
-  the NiceRF module, via libgpiod). Hop clock, beacons and radio control run
+  the NiceRF module, via the kernel GPIO character device v2 uAPI; no
+  libgpiod, whose v1/v2 APIs differ between Buildroot versions). Hop clock, beacons and radio control run
   in the Luckfox userspace apps. (Changed 2026-10-29; the Pico 2 modem from the
   design doc is dropped.)
 - Radio access goes through the C interface `common/radio.h`. Hardware
-  backend: RadioLib (`LR2021` class, `beginFLRC`) with a Linux spidev/gpiod
-  HAL, behind a thin C++ shim; host backend: simulated radio for `sim/`.
+  backend: `radio/` = RadioLib 7.8.1 (`LR2021` class, `beginFLRC`, submodule
+  pinned to the release tag) with `radio/linux_hal.cpp` (spidev + GPIO
+  chardev; IRQ edges polled with kernel timestamps, no callback threads).
+  `sim/` drives `common/` in virtual time and needs no radio.
 - Air and VRX Linux software: C11 on the luckfox-pico SDK (Buildroot, uClibc,
   toolchain `arm-rockchip830-linux-uclibcgnueabihf`), Rockchip MPI (rockit) for
   camera/ISP/encoder.
@@ -75,8 +78,9 @@ for host builds).
 
 ### Over-the-air packet (one LR2021 FLRC packet)
 
-Max payload per packet: confirm from the LR2021 datasheet and RadioLib in M0;
-design for 255 bytes total, header 12 bytes, little-endian, packed:
+Max payload per packet: 255 bytes total (RadioLib's
+RADIOLIB_LR2021_MAX_PACKET_LENGTH; still check the datasheet in M0), header 12
+bytes, little-endian, packed:
 
 ```c
 struct ota_hdr {
@@ -97,7 +101,8 @@ Hardware CRC on. A packet with a bad CRC is an erasure, never passed up.
 
 ### FEC
 
-- Inner: FLRC coding rate 3/4 by default (1/2 for the robust preset).
+- Inner: FLRC coding rate 3/4 by default (1/2 for the robust preset). The
+  LR2021 also offers 2/3 and uncoded.
 - Outer: Reed-Solomon erasure (zfex) per block; default k=8, n=12; one block
   per slice; shards of a block are spread across at least 3 hops.
 - Shard payload = encoded slice bytes split evenly, last shard zero-padded,
@@ -194,9 +199,10 @@ control. If not, fall back to row refresh, then to short GOPs.
    slice -> FEC -> packetize -> drop packets (random + bursty, two independent
    "receivers") -> merge -> decode -> write .mp4 and print stats. This is the
    main test bench until hardware arrives.
-6. `radio/` skeleton: RadioLib with a Linux spidev/gpiod HAL behind
-   `common/radio.h`; `tools/flrc_pingpong` FLRC TX/RX on a fixed channel
-   between two Luckfox boards, cross-compiled with the luckfox-pico SDK.
+6. `radio/` skeleton: RadioLib with a Linux spidev/GPIO HAL behind
+   `common/radio.h`; `tools/flrc_bench` (tx, rx, ping/pong, retune) on a fixed
+   channel between two Luckfox boards, cross-compiled with
+   `cmake/luckfox-rv1103.cmake`. Steps for the user: `docs/m0-bench.md`.
 7. `web/` skeleton: connect to N WebSocket URLs, merge by (frame, block,
    shard), WASM FEC, WebCodecs decode to canvas, per-VRX stats panel.
    `sim/` must be able to serve fake VRX WebSockets so the GUI can be developed

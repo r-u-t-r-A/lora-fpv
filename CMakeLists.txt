@@ -22,10 +22,25 @@ endif()
 
 enable_testing()
 
+option(OLV_RADIO "Build the LR2021 backend and bench tools (needs the RadioLib submodule)" ON)
+if(OLV_RADIO AND NOT EXISTS ${CMAKE_SOURCE_DIR}/third_party/RadioLib/CMakeLists.txt)
+    message(WARNING "third_party/RadioLib missing (git submodule update --init); radio disabled")
+    set(OLV_RADIO OFF)
+endif()
+if(OLV_RADIO)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+endif()
+
 add_subdirectory(third_party)
 add_subdirectory(common)
 add_subdirectory(sim)
 add_subdirectory(vrx)
+if(OLV_RADIO)
+    add_subdirectory(radio)
+    add_subdirectory(tools)
+endif()
 
 # Compile the browser's WASM glue on the host too, so warnings fail CI early.
 add_library(olv_wasm_check OBJECT web/wasm/olv_wasm.c)

@@ -9,7 +9,7 @@
 
 struct flrc_phy {
     uint32_t bitrate_bps; // gross FLRC bit rate
-    uint8_t cr;           // 2 = 1/2, 3 = 3/4, 4 = 1 (uncoded)
+    uint8_t cr;           // 2 = 1/2, 3 = 3/4, 4 = 1 (uncoded), 5 = 2/3
     uint16_t preamble_bits;
     uint16_t sync_bits;
     uint16_t header_bits; // coded together with payload and CRC
@@ -31,6 +31,9 @@ static inline uint32_t flrc_airtime_us(const struct flrc_phy *p, size_t len) {
         break;
     case 3:
         coded = (coded * 4 + 2) / 3;
+        break;
+    case 5:
+        coded = (coded * 3 + 1) / 2;
         break;
     default:
         break;
