@@ -11,11 +11,11 @@ This file is the working summary; if the two disagree, this file wins.
 
 ## The system in one paragraph
 
-An air unit (Luckfox Pico Mini RV1103 + 1080p camera + RPi Pico 2 + NiceRF
-LoRa2021F33-2G4 1 W module) captures video, encodes H.265 in hard CBR with
+An air unit (Luckfox Pico Mini RV1103 + 1080p camera + NiceRF
+LoRa2021F33-2G4 1 W module, driven directly by the RV1103 over SPI) captures video, encodes H.265 in hard CBR with
 column intra refresh, slices it, adds Reed-Solomon FEC and broadcasts it over
 FLRC with 100 Hz frequency hopping. Nothing on the ground ever transmits. On
-the ground, one or more identical VRX boxes (Luckfox RV1103 + Pico 2 + LR2021)
+the ground, one or more identical VRX boxes (Luckfox RV1103 + LR2021 on SPI)
 each appear to a Linux PC as a USB network adapter. A web GUI in Chrome
 connects to every VRX over WebSocket, merges packets (first good copy of each
 shard wins), rebuilds FEC in WASM, decodes H.265 with WebCodecs and draws a
@@ -31,8 +31,14 @@ MAVLink OSD.
   - No LoRa video mode.
 - Codec: H.265 in both modes. Ground PC is Linux; Chrome decodes via VA-API.
   Software fallback: libde265 compiled to WASM.
-- Pico 2 modem firmware: C, Pico SDK, RadioLib (`LR2021` class, `beginFLRC`).
-  Same binary for air (TX role) and VRX (RX role); role set by config.
+- No microcontroller in between: the RV1103 drives the LR2021 directly over
+  SPI (`spidev`) plus GPIOs (BUSY, IRQ, NRESET, any PA/RF-switch enables on
+  the NiceRF module, via libgpiod). Hop clock, beacons and radio control run
+  in the Luckfox userspace apps. (Changed 2026-10-29; the Pico 2 modem from the
+  design doc is dropped.)
+- Radio access goes through the C interface `common/radio.h`. Hardware
+  backend: RadioLib (`LR2021` class, `beginFLRC`) with a Linux spidev/gpiod
+  HAL, behind a thin C++ shim; host backend: simulated radio for `sim/`.
 - Air and VRX Linux software: C11 on the luckfox-pico SDK (Buildroot, uClibc,
   toolchain `arm-rockchip830-linux-uclibcgnueabihf`), Rockchip MPI (rockit) for
   camera/ISP/encoder.
@@ -47,11 +53,11 @@ MAVLink OSD.
 ## Repository layout (create this)
 
 ```
-common/          protocol headers shared by C code (ota.h, modem_link.h, fhss.c/.h)
+common/          shared C: ota.h, vrx_proto.h, fhss, fec, h265, vpkt (packetizer/reassembler), radio.h
 third_party/     zfex (vendored), RadioLib (git submodule), libde265 (submodule)
-firmware/modem/  Pico 2 firmware: CMake + Pico SDK + RadioLib
-air/             air-unit app for RV1103: capture -> encode -> slice -> FEC -> modem
-vrx/             VRX daemon for RV1103: modem -> WebSocket; static HTTP; config REST; usb-gadget scripts
+radio/           LR2021 backend for the RV1103: RadioLib + Linux spidev/gpiod HAL (C++ shim)
+air/             air-unit app for RV1103: capture -> encode -> slice -> FEC -> hop clock -> radio
+vrx/             VRX daemon for RV1103: radio + RX hop sync -> WebSocket; static HTTP; config REST; usb-gadget scripts
 web/             Chrome GUI (TypeScript + WASM FEC + WebCodecs + OSD)
 sim/             PC-only tools: lossy channel simulator, packet replay, loopback pipeline
 tools/           bench scripts: sensitivity sweeps, PER logging, plotting
@@ -95,7 +101,10 @@ Hardware CRC on. A packet with a bad CRC is an erasure, never passed up.
 - Outer: Reed-Solomon erasure (zfex) per block; default k=8, n=12; one block
   per slice; shards of a block are spread across at least 3 hops.
 - Shard payload = encoded slice bytes split evenly, last shard zero-padded,
-  real length carried in a 2-byte prefix of shard 0.
+  real length carried in a 2-byte prefix of shard 0 (bits 0-13 length,
+  bit 14 CONT, bit 15 MORE for NALs split across blocks). Small blocks use
+  fewer shards (min shard 32 B) at the same parity ratio. Implemented once in
+  `common/vpkt.c`, used by air, sim and (via WASM) the browser.
 
 ### Hopping
 
@@ -106,23 +115,27 @@ Hardware CRC on. A packet with a bad CRC is an erasure, never passed up.
 - Sequence: per cycle, a Fisher-Yates shuffle of the channel list driven by
   xorshift32 seeded with FNV-1a(bind phrase) XOR cycle number. Every channel
   appears once per cycle (ExpressLRS-style).
-- RX acquisition: park on one channel until any valid packet arrives (at most
-  one cycle), read `hop` and cycle position, start the local timer. After 3
+- Beacon (type 2) is the first packet of every hop: cycle u32, hop_us, channel
+  count, FEC defaults, TX power, offset from hop start. The header `hop` field
+  is written at transmit time by the air scheduler.
+- RX acquisition: park on one channel until a beacon arrives (cycles are
+  reshuffled, so worst case 2n-1 hops: 190 ms LR, 790 ms HQ), take cycle and
+  hop from it, start the local timer. After 3
   missed hops, coast on the local clock for 1 s, then re-park. On loss of
   lock the VRX alternates parking between the two bands to find the mode.
-- `common/fhss.c` is shared by firmware and host code and must have unit tests
+- `common/fhss.c` is shared by the air, VRX and host code and must have unit tests
   proving air and ground generate identical sequences.
 
-### Luckfox <-> Pico 2 link
+### Luckfox <-> LR2021
 
-SPI, Luckfox is master (`spidev`), Pico 2 is slave with DMA, 8 to 16 MHz, plus
-one GPIO from Pico to Luckfox as "data ready / buffer has room". Frames:
-
-```
-0xA5 | type u8 | len u16 | payload | crc16-ccitt
-type: 1 TX_PACKET (air), 2 RX_PACKET (vrx: ota bytes + rssi i16 + snr i8 + hop u8 + t_us u32),
-      3 CONFIG (json-free fixed struct), 4 STATUS, 5 LOG
-```
+The RV1103 is SPI master to the LR2021 (`spidev`, up to the LR2021 SPI limit;
+measure what is reliable on the wiring). GPIOs: BUSY (input), IRQ/DIO
+(input, edge events via libgpiod; the kernel event timestamp is the RX/TX done
+time), NRESET (output), plus whatever enables the NiceRF module needs for its
+PA/LNA (check the module datasheet). Hop timing runs in userspace on Linux:
+measure retune time and timer jitter on the RV1103 early (M0/M1); if jitter is
+too large, use SCHED_FIFO + mlockall first; offloading the hop timer to the
+SoC's small MCU core (if the SDK exposes it) is a later option, not a plan.
 
 ### VRX -> browser
 
@@ -130,7 +143,8 @@ type: 1 TX_PACKET (air), 2 RX_PACKET (vrx: ota bytes + rssi i16 + snr i8 + hop u
   `<id>` from `/etc/vrx.conf` (default derived from board serial). Do not keep
   the Luckfox default USB IP; two boards would collide.
 - `GET /` serves the web GUI; `GET/POST /api/config` for band, mode, bind
-  phrase; `ws://10.55.<id>.1:8080/rx` streams binary RX_PACKET frames.
+  phrase; `ws://10.55.<id>.1:8080/rx` streams binary records (`common/vrx_proto.h`): RX_PACKET =
+  ota bytes + rssi i16 + snr i8 + hop u8 + t_us u32, plus STATUS.
 - The GUI probes `10.55.1.1` to `10.55.8.1` and connects to every VRX found.
 - WebCodecs needs a secure context. Dev: add the VRX origins in
   `chrome://flags/#unsafely-treat-insecure-origin-as-secure`. Release: per-VRX
@@ -153,7 +167,7 @@ control. If not, fall back to row refresh, then to short GOPs.
 
 ## Milestones and exit gates
 
-- **M0 Bench bring-up**: Pico 2 + RadioLib drives LR2021; FLRC packets on 868
+- **M0 Bench bring-up**: RV1103 + RadioLib (Linux HAL) drives LR2021; FLRC packets on 868
   MHz and 2.4 GHz between two modules. Gate: sensitivity per rate measured
   through an attenuator, logged in `docs/reports/`.
 - **M1 Hopping modem**: 100 Hz hopping, TX-only sync, VRX daemon forwards to
@@ -166,22 +180,23 @@ control. If not, fall back to row refresh, then to short GOPs.
   glass-to-glass latency measured.
 - **M4 Field tests**: both modes at 1 W on the UGV; 1 vs 2 VRXs vs analog.
   Gate: range report published.
-- **M5 Public release**: firmware, GUI, BOM, wiring, build guide, region
+- **M5 Public release**: air/VRX images, GUI, BOM, wiring, build guide, region
   power profiles with a low-power default. Gate: someone else builds one.
 
 ## Where to start (first session)
 
 1. Scaffold the repo layout above, top-level CMake for host builds, CI with
    GitHub Actions (host build + unit tests + web build).
-2. `common/ota.h`, `common/modem_link.h` with pack/unpack + unit tests.
+2. `common/ota.h`, `common/vrx_proto.h` with pack/unpack + unit tests.
 3. `common/fhss.c` + tests (determinism, every channel once per cycle).
 4. FEC wrapper over zfex (`common/fec.c`) + tests (any k of n recovers).
 5. `sim/loopback`: encode a test clip with x265 using the settings above ->
    slice -> FEC -> packetize -> drop packets (random + bursty, two independent
    "receivers") -> merge -> decode -> write .mp4 and print stats. This is the
    main test bench until hardware arrives.
-6. `firmware/modem` skeleton: Pico SDK + RadioLib, FLRC TX/RX ping-pong on a
-   fixed channel, USB serial log.
+6. `radio/` skeleton: RadioLib with a Linux spidev/gpiod HAL behind
+   `common/radio.h`; `tools/flrc_pingpong` FLRC TX/RX on a fixed channel
+   between two Luckfox boards, cross-compiled with the luckfox-pico SDK.
 7. `web/` skeleton: connect to N WebSocket URLs, merge by (frame, block,
    shard), WASM FEC, WebCodecs decode to canvas, per-VRX stats panel.
    `sim/` must be able to serve fake VRX WebSockets so the GUI can be developed
@@ -198,7 +213,7 @@ control. If not, fall back to row refresh, then to short GOPs.
   max payload, TX/RX turnaround) gets a test in `tools/` and a number in
   `docs/`.
 - C: C11, `-Wall -Wextra -Werror`, clang-format (LLVM style, 4 spaces), no
-  dynamic allocation in the firmware hot path. TypeScript: `strict`, no `any`.
+  dynamic allocation in the radio/hop hot path. TypeScript: `strict`, no `any`.
 - Every protocol change updates `docs/protocol.md` and the shared headers in
   the same commit.
 - Keep all code GPL-3.0 compatible; check licences before vendoring anything.
