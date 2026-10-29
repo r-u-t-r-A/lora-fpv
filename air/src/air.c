@@ -2,21 +2,25 @@
 // Air unit: video source -> H.265 access units -> packetizer + FEC -> air
 // scheduler (100 Hz hop clock, beacons) -> radio.
 //
-// Video sources on the host: an IVF file of H.265 access units (e.g.
-// sim/loopback's reference.ivf), or a raw Annex-B stream on stdin (e.g.
-// ffmpeg ... -c:v libx265 -x265-params aud=1:... -f hevc -). The RV1103
-// encoder source (Rockchip MPI) plugs in here later (air/src/enc_rk.c).
-#define _GNU_SOURCE // clock_nanosleep, sched_setscheduler, mlockall
+// Video sources (air/src/vsrc.c): an IVF file of H.265 access units (e.g. a
+// test card or sim/loopback's reference.ivf), a raw Annex-B stream on stdin
+// (e.g. ffmpeg ... -c:v libx265 -x265-params aud=1:... -f hevc -), or
+// "camera": olv-cam (air/src/olv_cam.c, Rockchip MPI) as a child process,
+// sized and rate-controlled for this link, with a fallback clip (the NO
+// CAMERA test card) whenever the camera is not delivering.
+#define _GNU_SOURCE // clock_nanosleep, ppoll, sched_setscheduler, mlockall
 
 #include <errno.h>
 #include <getopt.h>
 #include <math.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,6 +33,7 @@
 #include "radio.h"
 #include "radio_conf.h"
 #include "vpkt.h"
+#include "vsrc.h"
 
 static volatile sig_atomic_t stop;
 
@@ -49,99 +54,14 @@ static void sleep_until_us(uint64_t t) {
     }
 }
 
-// ------------------------------------------------------------ video sources
-
-struct source {
-    FILE *f;
-    bool ivf, loop;
-    uint8_t *buf; // stdin: accumulated stream
-    size_t len, cap;
-};
-
-static int source_open(struct source *s, const char *path, bool loop) {
-    memset(s, 0, sizeof(*s));
-    s->loop = loop;
-    if (!strcmp(path, "-")) {
-        s->f = stdin;
-        s->cap = 1 << 20;
-        s->buf = malloc(s->cap);
-        return s->buf ? 0 : -1;
-    }
-    s->f = fopen(path, "rb");
-    if (!s->f) {
-        perror(path);
-        return -1;
-    }
-    uint8_t h[32];
-    if (fread(h, 1, 32, s->f) != 32 || memcmp(h, "DKIF", 4) != 0) {
-        fprintf(stderr, "%s: not an IVF file (use - for an Annex-B stream on stdin)\n", path);
-        return -1;
-    }
-    s->ivf = true;
-    return 0;
-}
-
-// Next access unit into au (cap bytes). Returns its length, 0 at end.
-static size_t source_next(struct source *s, uint8_t *au, size_t cap) {
-    if (s->ivf) {
-        for (int attempt = 0; attempt < 2; attempt++) {
-            uint8_t fh[12];
-            if (fread(fh, 1, 12, s->f) == 12) {
-                uint32_t n = olv_get_u32(fh);
-                if (n > cap) {
-                    fseek(s->f, n, SEEK_CUR);
-                    return source_next(s, au, cap);
-                }
-                if (fread(au, 1, n, s->f) == n)
-                    return n;
-            }
-            if (!s->loop)
-                return 0;
-            fseek(s->f, 32, SEEK_SET);
-        }
-        return 0;
-    }
-    // Annex B on stdin: an AU is complete once the next one has started.
-    for (;;) {
-        size_t pos = 0, first = SIZE_MAX, second = SIZE_MAX;
-        struct h265_nal nal;
-        bool vcl = false;
-        while (h265_next_nal(s->buf, s->len, &pos, &nal)) {
-            bool starts = (nal.type == H265_NAL_AUD || nal.type == H265_NAL_VPS ||
-                           (h265_is_vcl(nal.type) && h265_first_slice(s->buf, &nal)));
-            if (first == SIZE_MAX) {
-                first = nal.start;
-            } else if (starts && vcl) {
-                second = nal.start;
-                break;
-            }
-            if (h265_is_vcl(nal.type))
-                vcl = true;
-        }
-        if (second != SIZE_MAX) {
-            size_t n = second - first;
-            if (n > cap)
-                n = cap;
-            memcpy(au, s->buf + first, n);
-            memmove(s->buf, s->buf + second, s->len - second);
-            s->len -= second;
-            return n;
-        }
-        if (s->len == s->cap) {
-            s->cap *= 2;
-            s->buf = realloc(s->buf, s->cap);
-        }
-        size_t r = fread(s->buf + s->len, 1, s->cap - s->len, s->f);
-        if (r == 0) {
-            if (s->len == 0 || first == SIZE_MAX)
-                return 0;
-            size_t n = s->len - first < cap ? s->len - first : cap; // last AU
-            memcpy(au, s->buf + first, n);
-            s->len = 0;
-            return n;
-        }
-        s->len += r;
-    }
+// Sleeps until t or until fd is readable, whichever is first.
+static void wait_fd_until_us(int fd, uint64_t t) {
+    uint64_t now = mono_us();
+    if (t <= now)
+        return;
+    struct timespec ts = {(time_t)((t - now) / 1000000u), (long)((t - now) % 1000000u) * 1000};
+    struct pollfd p = {.fd = fd, .events = POLLIN};
+    ppoll(&p, 1, &ts, NULL);
 }
 
 // --------------------------------------------------------------------- main
@@ -157,7 +77,7 @@ static void enqueue(void *ctx, const uint8_t *pkt, size_t len) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: air --source FILE.ivf|- [options]\n"
+            "usage: air --source FILE.ivf|-|camera [options]\n"
             "  --mode lr520|lr260|hq2600|hq1300   (default lr520; hq1300 on a 2.4 GHz-only chip)\n"
             "  --bind PHRASE        (default open-lr-video)\n"
             "  --fps N              frame rate of the source (default: mode)\n"
@@ -165,21 +85,32 @@ static void usage(void) {
             "  --k N --n N          FEC shape (default 8/12)\n"
             "  --shard N            shard bytes (default: best fit per hop)\n"
             "  --max-packet N       packet size limit (default: the chip's, 255 LR2021 / 127\n"
-            "                       SX1280; use 127 when SX1280 VRXs listen to an LR2021 air)\n"
+            "                       SX1280)\n"
             "  --cr N               FLRC coding rate (2=1/2 3=3/4 4=1 5=2/3; default: mode)\n"
             "  --radio-conf PATH    wiring (default " RADIO_CONF_PATH ")\n"
             "  --power DBM          chip output (default from radio conf, -9)\n"
             "  --outdoor            allow > 0 dBm\n"
             "  --rt                 SCHED_FIFO + mlockall\n"
-            "  --seconds S          stop after S seconds\n");
+            "  --seconds S          stop after S seconds\n"
+            "camera source (--source camera):\n"
+            "  --camera-cmd PATH    camera program (default olv-cam); it gets --size, --fps,\n"
+            "                       --kbps, --refresh and --slice-bytes and writes IVF to stdout\n"
+            "  --camera-args ARGS   extra arguments for it, space-separated (e.g. \"--flip\")\n"
+            "  --size WxH           picture (default: mode)\n"
+            "  --kbps N             CBR target (default: 85%% of the link's video capacity)\n"
+            "  --refresh S          intra refresh sweep period (default: mode)\n"
+            "  --fallback FILE.ivf  looped while the camera is not delivering (NO CAMERA card)\n"
+            "  --camera-retry S     restart a failed camera after S seconds (default 5)\n");
 }
 
 int main(int argc, char **argv) {
     const char *src_path = NULL, *bind = "open-lr-video", *conf = RADIO_CONF_PATH;
     const struct olv_mode *mode = NULL;
     int fps = 0, k = 8, n = 12, shard = 0, cr = 0, power = 1000, max_packet = 0;
+    const char *cam_cmd = "olv-cam", *cam_args = "", *fallback = NULL;
+    int w = 0, h = 0, kbps = 0;
     bool loop = false, outdoor = false, rt = false;
-    double seconds = 0;
+    double seconds = 0, refresh = 0, cam_retry = 5;
     enum {
         O_SRC = 256,
         O_MODE,
@@ -195,7 +126,14 @@ int main(int argc, char **argv) {
         O_OUTDOOR,
         O_RT,
         O_SEC,
-        O_MAXPKT
+        O_MAXPKT,
+        O_CAMCMD,
+        O_CAMARGS,
+        O_SIZE,
+        O_KBPS,
+        O_REFRESH,
+        O_FALLBACK,
+        O_RETRY
     };
     static const struct option lo[] = {{"source", 1, 0, O_SRC},
                                        {"mode", 1, 0, O_MODE},
@@ -212,6 +150,13 @@ int main(int argc, char **argv) {
                                        {"rt", 0, 0, O_RT},
                                        {"seconds", 1, 0, O_SEC},
                                        {"max-packet", 1, 0, O_MAXPKT},
+                                       {"camera-cmd", 1, 0, O_CAMCMD},
+                                       {"camera-args", 1, 0, O_CAMARGS},
+                                       {"size", 1, 0, O_SIZE},
+                                       {"kbps", 1, 0, O_KBPS},
+                                       {"refresh", 1, 0, O_REFRESH},
+                                       {"fallback", 1, 0, O_FALLBACK},
+                                       {"camera-retry", 1, 0, O_RETRY},
                                        {"help", 0, 0, 'h'},
                                        {0, 0, 0, 0}};
     int c;
@@ -264,6 +209,30 @@ int main(int argc, char **argv) {
             break;
         case O_MAXPKT:
             max_packet = atoi(optarg);
+            break;
+        case O_CAMCMD:
+            cam_cmd = optarg;
+            break;
+        case O_CAMARGS:
+            cam_args = optarg;
+            break;
+        case O_SIZE:
+            if (sscanf(optarg, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0) {
+                fprintf(stderr, "--size wants WxH\n");
+                return 2;
+            }
+            break;
+        case O_KBPS:
+            kbps = atoi(optarg);
+            break;
+        case O_REFRESH:
+            refresh = atof(optarg);
+            break;
+        case O_FALLBACK:
+            fallback = optarg;
+            break;
+        case O_RETRY:
+            cam_retry = atof(optarg);
             break;
         default:
             usage();
@@ -340,9 +309,50 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid FEC/shard settings\n");
         return 2;
     }
-    struct source src;
-    if (source_open(&src, src_path, loop))
-        return 1;
+    bool camera = !strcmp(src_path, "camera");
+    struct vsrc_file file;
+    bool have_file = false;
+    if (camera) {
+        if (fallback && !(have_file = vsrc_file_open(&file, fallback, true) == 0))
+            fprintf(stderr, "air: fallback %s unusable; no video while the camera is down\n",
+                    fallback);
+    } else {
+        if (vsrc_file_open(&file, src_path, loop))
+            return 1;
+        have_file = true;
+    }
+    // Camera: picture, rate control and slices sized for this link. One
+    // slice per FEC block, so a lost block costs one slice, not a frame.
+    static struct vsrc_cam cam = {.fd = -1};
+    char cam_size[32], cam_fps[16], cam_kbps[16], cam_refresh[16], cam_slice[16];
+    static char cam_extra[512];
+    char *cam_argv[48];
+    if (camera) {
+        double cap_kbps = shard_bps / 1000.0 * k / n;
+        snprintf(cam_size, sizeof(cam_size), "%dx%d", w ? w : mode->w, h ? h : mode->h);
+        snprintf(cam_fps, sizeof(cam_fps), "%d", fps);
+        snprintf(cam_kbps, sizeof(cam_kbps), "%d", kbps ? kbps : (int)(cap_kbps * 0.85));
+        snprintf(cam_refresh, sizeof(cam_refresh), "%.2f", refresh > 0 ? refresh : mode->refresh_s);
+        snprintf(cam_slice, sizeof(cam_slice), "%zu", vpkt_block_capacity(&tc));
+        size_t na = 0;
+        cam_argv[na++] = (char *)cam_cmd;
+        const char *fixed[] = {"--size",        cam_size,  "--fps",     cam_fps,
+                               "--kbps",        cam_kbps,  "--refresh", cam_refresh,
+                               "--slice-bytes", cam_slice, "--out",     "-"};
+        for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
+            cam_argv[na++] = (char *)fixed[i];
+        snprintf(cam_extra, sizeof(cam_extra), "%s", cam_args);
+        for (char *t = strtok(cam_extra, " \t"); t && na < 47; t = strtok(NULL, " \t"))
+            cam_argv[na++] = t;
+        cam_argv[na] = NULL;
+        if (kbps > cap_kbps)
+            fprintf(stderr, "air: WARNING: --kbps %d exceeds the link's video capacity (%.0f)\n",
+                    kbps, cap_kbps);
+        printf("air: camera command:");
+        for (size_t i = 0; i < na; i++)
+            printf(" %s", cam_argv[i]);
+        printf("\n");
+    }
 
     if (rt) {
         struct sched_param sp = {.sched_priority = 50};
@@ -369,31 +379,73 @@ int main(int argc, char **argv) {
     airsched_init(&as, &sc, t0);
     radio_calibrate(r, fhss_freq_hz(&mode->band, fhss_seq_channel(&as.seq, 0, 0)));
     uint64_t frame_us = 1000000u / (uint64_t)fps, next_frame = t0, next_report = t0 + 1000000u;
-    uint32_t frames = 0, overruns = 0, tx_errors = 0, late_frames = 0;
-    bool eof = false;
+    uint64_t retry_us = (uint64_t)(cam_retry * 1e6), cam_retry_at = t0;
+    uint32_t frames = 0, overruns = 0, tx_errors = 0, late_frames = 0, cam_frames = 0;
+    bool eof = false, cam_live = false; // cam_live: the camera is delivering
+    int cfg_fps = fps;
     uint8_t cur_ch = 0xFF;
 
     while (!stop && !(eof && airsched_queued(&as) == 0)) {
         uint64_t now = mono_us();
         if (seconds > 0 && now - t0 >= (uint64_t)(seconds * 1e6))
             break;
-        if (!eof && now >= next_frame) {
-            size_t len = source_next(&src, au, sizeof(au));
-            if (len == 0) {
-                eof = true;
-            } else {
-                bool has_ps;
-                size_t plen = h265_prepare_au(&ps, au, len, frames % (uint32_t)fps == 0, prep,
-                                              sizeof(prep), &has_ps);
-                if (plen)
-                    vpkt_tx_frame(&tx, prep, plen, enqueue, &ectx);
-                frames++;
+        size_t len = 0;
+        if (camera && cam.fd < 0 && now >= cam_retry_at) {
+            cam_retry_at = now + retry_us;
+            if (vsrc_cam_start(&cam, cam_argv, sizeof(au)) == 0)
+                printf("air: camera: started %s (pid %d)\n", cam_cmd, (int)cam.pid);
+        }
+        if (cam.fd >= 0) {
+            long got_len = vsrc_cam_poll(&cam, au, sizeof(au));
+            if (got_len > 0) {
+                len = (size_t)got_len;
+                if (!cam_live) {
+                    cam_live = true;
+                    if (cam.fps > 0)
+                        fps = cam.fps;
+                    printf("air: camera: %dx%d@%d, sending camera video\n", cam.w, cam.h, cam.fps);
+                }
+                cam_frames++;
+            } else if (got_len < 0) {
+                uint32_t got = cam.frames;
+                int st = vsrc_cam_stop(&cam);
+                char why[32];
+                if (st >= 0 && WIFEXITED(st))
+                    snprintf(why, sizeof(why), "exit %d", WEXITSTATUS(st));
+                else if (st >= 0 && WIFSIGNALED(st))
+                    snprintf(why, sizeof(why), "signal %d", WTERMSIG(st));
+                else
+                    snprintf(why, sizeof(why), "gone");
+                printf("air: camera: stopped (%s) after %u frames; %s, retry in %.0f s\n", why, got,
+                       have_file ? "sending the fallback" : "no video", cam_retry);
+                cam_live = false;
+                fps = cfg_fps;
+                frame_us = 1000000u / (uint64_t)fps;
+                next_frame = now;
+                cam_retry_at = now + retry_us;
+                if (have_file)
+                    vsrc_file_rewind(&file); // the clip starts with an IDR
             }
+        }
+        if (!len && have_file && !cam_live && !eof && now >= next_frame) {
+            len = vsrc_file_next(&file, au, sizeof(au));
+            if (len == 0 && !camera)
+                eof = true;
             next_frame += frame_us;
             if (now > next_frame + frame_us) { // fell behind: do not try to catch up
                 late_frames++;
                 next_frame = now + frame_us;
             }
+            if (len == 0)
+                continue;
+        }
+        if (len) {
+            bool has_ps;
+            size_t plen = h265_prepare_au(&ps, au, len, frames % (uint32_t)fps == 0, prep,
+                                          sizeof(prep), &has_ps);
+            if (plen)
+                vpkt_tx_frame(&tx, prep, plen, enqueue, &ectx);
+            frames++;
             continue;
         }
         struct airsched_action a;
@@ -421,26 +473,32 @@ int main(int argc, char **argv) {
                 overruns++; // the packet ran into the next hop: timing problem
         } else {
             uint64_t wake = a.wake_us;
-            if (!eof && next_frame < wake)
+            if (have_file && !cam_live && !eof && next_frame < wake)
                 wake = next_frame;
-            sleep_until_us(wake);
+            if (camera && cam.fd < 0 && cam_retry_at < wake)
+                wake = cam_retry_at;
+            if (cam.fd >= 0)
+                wait_fd_until_us(cam.fd, wake); // a camera frame wakes us early
+            else
+                sleep_until_us(wake);
         }
         if (now >= next_report) {
-            printf("air: %u frames, %u pkts, %u beacons, queue %u, drops %u, overruns %u, late "
-                   "frames %u, tx errors %u\n",
-                   frames, as.st.sent, as.st.beacons, airsched_queued(&as), as.st.dropped, overruns,
-                   late_frames, tx_errors);
+            printf("air: %u frames (%u camera), %u pkts, %u beacons, queue %u, drops %u, overruns "
+                   "%u, late frames %u, tx errors %u\n",
+                   frames, cam_frames, as.st.sent, as.st.beacons, airsched_queued(&as),
+                   as.st.dropped, overruns, late_frames, tx_errors);
             fflush(stdout);
             next_report += 1000000u;
         }
     }
     printf("air: done, %u frames, %u packets, %u beacons, %u drops, %u overruns\n", frames,
            as.st.sent, as.st.beacons, as.st.dropped, overruns);
+    vsrc_cam_stop(&cam);
+    free(cam.buf);
     radio_close(r);
     vpkt_tx_free(&tx);
     fec_free_cache();
-    free(src.buf);
-    if (src.f && src.f != stdin)
-        fclose(src.f);
+    if (have_file)
+        vsrc_file_close(&file);
     return 0;
 }

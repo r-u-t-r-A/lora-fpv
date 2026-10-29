@@ -53,4 +53,10 @@ if(FFMPEG AND Python3_FOUND)
                      --lock-limit-ms 2000)
     set_tests_properties(m1_link_e28 m1_scan_2g4 PROPERTIES FIXTURES_REQUIRED lr_clip LABELS sim
                                                             TIMEOUT 60)
+    # Camera source: sim/fake_cam.py stands in for olv-cam, dies, the fallback
+    # takes over, the camera comes back.
+    add_test(NAME cam_source
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cam_source.py
+                     ${CMAKE_BINARY_DIR} ${CMAKE_BINARY_DIR}/m2_lr520/reference.ivf)
+    set_tests_properties(cam_source PROPERTIES FIXTURES_REQUIRED lr_clip LABELS sim TIMEOUT 60)
 endif()

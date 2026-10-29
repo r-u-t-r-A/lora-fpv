@@ -1,0 +1,5 @@
+add_executable(test_cam_sensors test_cam_sensors.c)
+target_include_directories(test_cam_sensors PRIVATE ${CMAKE_SOURCE_DIR}/common/tests)
+target_link_libraries(test_cam_sensors PRIVATE olv_air)
+target_compile_options(test_cam_sensors PRIVATE ${OLV_WARNINGS})
+add_test(NAME test_cam_sensors COMMAND test_cam_sensors)
