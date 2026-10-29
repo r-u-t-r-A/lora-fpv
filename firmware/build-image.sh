@@ -4,20 +4,23 @@
 # added to the stock luckfox-pico SDK Buildroot image.
 #
 # What it does, in order:
-#   1. cross-compiles air, vrxd and flrc_bench with the SDK toolchain;
-#   2. builds the web GUI (or takes a prebuilt one) and the test-card clips
-#      the air unit sends while there is no camera source;
+#   1. cross-compiles air, olv-cam, vrxd and flrc_bench with the SDK
+#      toolchain;
+#   2. builds the web GUI (or takes a prebuilt one) and the clips the air
+#      unit sends without a camera (test card, NO CAMERA card);
 #   3. stages a rootfs overlay (firmware/overlay + generated config) as
 #      project/cfg/BoardConfig_IPC/overlay/overlay-olv in the SDK;
 #   4. writes an OLV board config next to the stock Pico Mini one (same
-#      settings + our overlay + an OEM hook that keeps rkipc off), and
+#      settings + our overlay + an OEM hook that keeps rkipc off + the
+#      drivers and IQ files of every camera in air/src/cam_sensors.c), and
 #      optionally enables busybox udhcpd so a VRX gives the PC an address;
 #   5. runs the SDK build (full the first time, then only "firmware") once
 #      per role and copies each image to firmware/out/.
 #
 # The SDK is only modified inside project/cfg/BoardConfig_IPC (our files,
-# all named *olv*/*OLV*), its .BoardConfig.mk link (restored at exit) and,
-# unless --no-dhcp, one line of its busybox config.
+# all named *olv*/*OLV*), its .BoardConfig.mk link (restored at exit), one
+# kernel config fragment (arch/arm/configs/olv-camera.config) and, unless
+# --no-dhcp, one line of its busybox config.
 set -euo pipefail
 
 usage() {
@@ -125,11 +128,13 @@ work=$out/work
 mkdir -p "$work"
 
 # ------------------------------------------------------ 1. our programs
-step "cross-compiling air, vrxd, flrc_bench"
+step "cross-compiling air, olv-cam, vrxd, flrc_bench"
 git -C "$repo" submodule update --init third_party/RadioLib >/dev/null
+[ -f "$sdk/media/rockit/rockit/lib/lib32/librockit.so" ] ||
+    die "$sdk has no media/rockit (Rockchip MPI) libraries: incomplete SDK checkout?"
 cmake -S "$repo" -B "$work/build-rv1103" -DCMAKE_TOOLCHAIN_FILE="$repo/cmake/luckfox-rv1103.cmake" \
     -DLUCKFOX_SDK="$sdk" -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$work/build-rv1103" -j"$(nproc)" --target air vrxd flrc_bench
+cmake --build "$work/build-rv1103" -j"$(nproc)" --target air olv-cam vrxd flrc_bench
 
 # ------------------------------------------------- 2. GUI and test cards
 step "web GUI"
@@ -155,22 +160,30 @@ else
 fi
 [ -n "$www" ] && echo "GUI from $www"
 
-step "test cards (what the air unit sends until the camera source exists)"
+step "test cards (what the air unit sends without a camera)"
 command -v ffmpeg >/dev/null || die "ffmpeg (with libx265) is needed for the test cards"
 cmake -S "$repo" -B "$work/build-host" -DOLV_RADIO=OFF -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "$work/build-host" -j"$(nproc)" --target loopback
 cards=$work/testcards/$chip # clips are sized for the chip's packet limit
 mkdir -p "$cards"
-for m in $modes; do
-    clip=$cards/testcard-$m.ivf
+card() { # card MODE NAME SECONDS [LABEL]: sized for the chip's packet limit
+    local m=$1 name=$2 secs=$3 clip=$cards/$2-$1.ivf
     if [ ! -f "$clip" ] || [ "$work/build-host/sim/loopback" -nt "$clip" ]; then
-        # Sized for the chip's packet limit, so it fits the link it is sent on.
-        "$work/build-host/sim/loopback" --mode "$m" --chip "$chip" --seconds 10 \
-            --out "$cards/$m" >"$cards/$m.log" 2>&1 ||
-            die "test card for $m failed, see $cards/$m.log"
-        cp "$cards/$m/reference.ivf" "$clip"
+        "$work/build-host/sim/loopback" --mode "$m" --chip "$chip" --seconds "$secs" \
+            ${4:+--label "$4"} --out "$cards/$name-$m" >"$cards/$name-$m.log" 2>&1 || return 1
+        cp "$cards/$name-$m/reference.ivf" "$clip"
     fi
-    echo "  $m: $(grep -m1 '^ *video [0-9]' "$cards/$m.log" | sed 's/^ *//')"
+    echo "  $name-$m: $(grep -m1 '^ *video [0-9]' "$cards/$name-$m.log" | sed 's/^ *//')"
+}
+for m in $modes; do
+    card "$m" testcard 10 || die "test card for $m failed, see $cards/testcard-$m.log"
+    # Played while the camera is missing or restarting. drawtext needs an
+    # ffmpeg with fontconfig and a font; without them, an unlabelled card.
+    card "$m" nocamera 4 "NO CAMERA" || {
+        echo "  WARNING: ffmpeg could not draw the NO CAMERA label (see $cards/nocamera-$m.log);"
+        echo "           using the plain test card as the no-camera fallback"
+        cp "$cards/testcard-$m.ivf" "$cards/nocamera-$m.ivf"
+    }
 done
 
 # ------------------------------------------------------ 3. rootfs overlay
@@ -180,10 +193,10 @@ stage() { # stage ROLE: assemble the overlay for one role into $work/overlay-olv
     [ "$r" = air ] && [ $air_autostart = 0 ] && enabled=0
     rm -rf "$o" && mkdir -p "$o/usr/bin" "$o/usr/share/olv" "$o/etc"
     rsync -a "$here/overlay/" "$o/"
-    for b in air/air:olv-air vrx/vrxd:olv-vrxd tools/flrc_bench:flrc_bench; do
+    for b in air/air:olv-air air/olv-cam:olv-cam vrx/vrxd:olv-vrxd tools/flrc_bench:flrc_bench; do
         "$tc-strip" -o "$o/usr/bin/${b#*:}" "$work/build-rv1103/${b%%:*}"
     done
-    cp "$cards"/testcard-*.ivf "$o/usr/share/olv/"
+    cp "$cards"/testcard-*.ivf "$cards"/nocamera-*.ivf "$o/usr/share/olv/"
     [ -n "$www" ] && rsync -a "$www/" "$o/usr/share/olv/www/"
     cp "$here/conf/olv-radio-$radio.conf" "$o/etc/olv-radio.conf"
     cat >"$o/etc/olv.conf" <<EOF
@@ -193,8 +206,9 @@ enabled=$enabled            # 1: start at boot. Air: only with antenna or attenu
 # air unit
 mode=$mode           # link mode: $modes
 bind=$bind
-source=testcard      # testcard (/usr/share/olv/testcard-<mode>.ivf) or a path to an .ivf
-air_args=            # extra air options, e.g. --power -12; >0 dBm needs --outdoor
+source=camera        # camera (NO CAMERA card while it is missing), testcard, or an .ivf path
+camera_args=         # extra olv-cam options, e.g. --flip --mirror (olv-cam --help)
+air_args=            # extra air options, e.g. --power -12 or --kbps 300; >0 dBm needs --outdoor
 # VRX: id, band, mode and bind phrase are in /etc/vrx.conf
 vrx_args=
 EOF
@@ -215,9 +229,19 @@ EOF
 # --------------------------------------------------- 4. board config etc.
 step "board config $olv_cfg"
 cp "$here/olv-oem-pre.sh" "$cfgdir/olv-oem-pre.sh"
-python3 - "$cfgdir/$stock_cfg" "$cfgdir/$olv_cfg" "$olv_cfg" <<'EOF'
+# Cameras: every sensor in air/src/cam_sensors.c gets its kernel driver (a
+# config fragment; the stock kernel builds only the SC3336) and its rkaiq IQ
+# file. The stock device tree already has nodes for them on the CSI port.
+kcfg=$sdk/sysdrv/source/kernel/arch/arm/configs/olv-camera.config
+[ -d "$(dirname "$kcfg")" ] || die "kernel source not found in $sdk/sysdrv/source/kernel"
+python3 - "$cfgdir/$stock_cfg" "$cfgdir/$olv_cfg" "$olv_cfg" "$repo/air/src/cam_sensors.c" "$kcfg" <<'EOF'
 import re, sys
-src, dst, name = sys.argv[1:]
+src, dst, name, cams_c, kcfg = sys.argv[1:]
+cams = re.findall(r'\{"(\w+)",\s*"[^"]*",\s*"(CONFIG_\w+)",\s*"([^"]+)"', open(cams_c).read())
+if not cams:
+    sys.exit('no sensors parsed from ' + cams_c)
+open(kcfg, 'w').write('# open-lr-video camera sensors (air/src/cam_sensors.c)\n' +
+                      ''.join('%s=m\n' % k for _, k, _ in cams))
 s = open(src).read()
 s = re.sub(r'(?m)^export LF_ORIGIN_BOARD_CONFIG=.*$', 'export LF_ORIGIN_BOARD_CONFIG=' + name, s)
 s = re.sub(r'(?m)^export RK_PRE_BUILD_OEM_SCRIPT=.*$', 'export RK_PRE_BUILD_OEM_SCRIPT=olv-oem-pre.sh', s)
@@ -225,11 +249,20 @@ m = re.search(r'(?m)^export RK_POST_OVERLAY="([^"]*)"', s)
 if not m:
     sys.exit('no RK_POST_OVERLAY in ' + src)
 s = s[:m.start()] + 'export RK_POST_OVERLAY="%s overlay-olv"' % m.group(1) + s[m.end():]
+def set_var(s, var, fn):
+    m = re.search(r'(?m)^export %s="?([^"\n]*)"?$' % var, s)
+    new = 'export %s="%s"' % (var, fn(m.group(1).split() if m else []))
+    return s[:m.start()] + new + s[m.end():] if m else s + new + '\n'
+union = lambda extra: lambda old: ' '.join(old + [x for x in extra if x not in old])
+s = set_var(s, 'RK_KERNEL_DEFCONFIG_FRAGMENT', union(['olv-camera.config']))
+s = set_var(s, 'RK_CAMERA_SENSOR_IQFILES', union([iq + '.json' for _, _, iq in cams]))
 hdr = ('#!/bin/bash\n# Generated by open-lr-video firmware/build-image.sh from %s:\n'
        '# same board, plus the overlay-olv rootfs overlay and olv-oem-pre.sh.\n' % src.rsplit('/', 1)[1])
 open(dst, 'w').write(hdr + s.replace('#!/bin/bash\n', '', 1))
 EOF
-grep -E "RK_POST_OVERLAY|RK_PRE_BUILD_OEM_SCRIPT|RK_KERNEL_DTS|RK_BOOT_MEDIUM" "$cfgdir/$olv_cfg" | sed 's/^/  /'
+grep -E "^export (RK_POST_OVERLAY|RK_PRE_BUILD_OEM_SCRIPT|RK_KERNEL_DTS|RK_BOOT_MEDIUM|RK_KERNEL_DEFCONFIG_FRAGMENT|RK_CAMERA_SENSOR_IQFILES)=" \
+    "$cfgdir/$olv_cfg" | sed 's/^/  /'
+sed 's/^/  /' "$kcfg"
 
 if [ $dhcp = 1 ]; then
     step "busybox udhcpd (VRX hands the PC an address on USB)"
@@ -263,7 +296,9 @@ ln -rsfn "$cfgdir/$olv_cfg" "$link"
 # changes (another medium means another U-Boot, partition table, rootfs type).
 rootfs_tar=$sdk/output/out/sysdrv_out/rootfs_uclibc_rv1106.tar
 stamp=$sdk/output/.olv-board-config
-[ -f "$rootfs_tar" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$olv_cfg" ] || full=1
+# Also when the camera drivers or IQ files change (kernel and oem partition).
+stamp_id="$olv_cfg $(cat "$kcfg" "$cfgdir/$olv_cfg" | md5sum | cut -c1-12)"
+[ -f "$rootfs_tar" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$stamp_id" ] || full=1
 first=1
 for r in $roles; do
     step "image for role $r"
@@ -272,7 +307,7 @@ for r in $roles; do
         echo "full SDK build (uboot, kernel, rootfs, media, app, firmware): this takes a while"
         rm -f "$stamp"
         (cd "$sdk" && ./build.sh all)
-        echo "$olv_cfg" >"$stamp"
+        echo "$stamp_id" >"$stamp"
     else
         (cd "$sdk" && ./build.sh firmware)
     fi

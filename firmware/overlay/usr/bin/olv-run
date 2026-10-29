@@ -36,9 +36,15 @@ done
 case "$role" in
 air)
     mode=$(conf mode hq1300)
-    source=$(conf source testcard)
-    [ "$source" = testcard ] && source=/usr/share/olv/testcard-$mode.ivf
-    set -- /usr/bin/olv-air --source "$source" --loop --mode "$mode" \
+    source=$(conf source camera)
+    case "$source" in
+    camera) # olv-cam, sized by air for the link; the NO CAMERA card while it is down
+        set -- --source camera --camera-cmd /usr/bin/olv-cam \
+            --fallback /usr/share/olv/nocamera-$mode.ivf --camera-args "$(conf camera_args "")" ;;
+    testcard) set -- --source /usr/share/olv/testcard-$mode.ivf --loop ;;
+    *) set -- --source "$source" --loop ;;
+    esac
+    set -- /usr/bin/olv-air "$@" --mode "$mode" \
         --bind "$(conf bind open-lr-video)" --radio-conf "$radio_conf" --rt $(conf air_args "")
     ;;
 vrx)

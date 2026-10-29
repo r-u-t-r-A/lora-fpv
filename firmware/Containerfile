@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Build environment for firmware/build-image.sh: Ubuntu 22.04, which the
 # luckfox-pico SDK supports, with the SDK's documented host packages plus
-# what our build needs (ffmpeg/libx265 for the test cards, ninja, git).
+# what our build needs (ffmpeg/libx265 for the test cards, a font for their
+# NO CAMERA label, ninja, git).
 #
 #   podman build -t olv-fw -f firmware/Containerfile firmware
 #   firmware/build-in-container.sh --sdk ~/luckfox-pico [build-image.sh options]
@@ -14,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         device-tree-compiler libncurses5-dev pkg-config bc python-is-python3 passwd \
         openssl openssh-client vim file cpio rsync \
         ca-certificates wget curl xz-utils bzip2 patch perl python3 \
-        ffmpeg ninja-build sudo locales \
+        ffmpeg fontconfig fonts-dejavu-core ninja-build sudo locales \
     && rm -rf /var/lib/apt/lists/* \
     && locale-gen en_US.UTF-8
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8

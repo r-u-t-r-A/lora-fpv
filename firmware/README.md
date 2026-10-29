@@ -9,8 +9,12 @@ image per role (air unit, VRX); `flash.sh` puts it on a board.
 and in the Ubuntu 22.04 container, and the SD writer was checked byte by
 byte on an image file. The full SDK build, flashing and booting a real board
 have **not** been done yet: expect to report a problem or two the first
-time. The air unit has no camera source yet; it loops a test card
-(`testsrc2` pattern, H.265, sized to fit the link).
+time.
+
+The air unit sends the camera (SC3336, SC4336 or SC530AI; see
+[docs/camera.md](../docs/camera.md)). With no camera it loops a "NO CAMERA"
+test card, sized to fit the link. The camera program `olv-cam` has been
+cross-built but not yet run on a board.
 
 Contents: [1 Prerequisites](#1-prerequisites) ·
 [2 Build](#2-build) · [3 Flash](#3-flash) · [4 First boot](#4-first-boot) ·
@@ -186,6 +190,7 @@ ssh root@10.55.1.1                        # air unit: root@172.32.0.93; password
 cat /etc/olv-build                        # version and build options
 ls /dev/spidev0.0                         # SPI0 is on (from /etc/luckfox.cfg)
 cat /var/log/olv.log                      # output of olv-vrxd / olv-air
+olv-cam --list                            # air unit: which camera is fitted
 ```
 
 Expected on a VRX with the radio wired: `olv-run: role vrx: ...`, then
@@ -212,6 +217,7 @@ ssh root@172.32.0.93
 sed -i 's/^enabled=0/enabled=1/' /etc/olv.conf    # start at every boot from now on
 /etc/init.d/S99olv start
 tail -f /var/log/olv.log                          # air: hq1300 on sx1280, ...
+                                                  # air: camera: 1280x720@30, sending camera video
 ```
 
 It sends at the radio conf's `power_dbm`: -18 dBm at the chip for the E28,
@@ -245,13 +251,13 @@ The cross-built programs are in `firmware/out/work/build-rv1103/` after any
 build; rebuild just them and copy them over:
 
 ```sh
-cmake --build firmware/out/work/build-rv1103 --target air vrxd flrc_bench
+cmake --build firmware/out/work/build-rv1103 --target air olv-cam vrxd flrc_bench
 ssh root@10.55.1.1 /etc/init.d/S99olv stop
 scp firmware/out/work/build-rv1103/vrx/vrxd root@10.55.1.1:/usr/bin/olv-vrxd
 ssh root@10.55.1.1 /etc/init.d/S99olv start
 ```
 
-(air unit: `air/air` to `/usr/bin/olv-air`; bench tool:
+(air unit: `air/air` to `/usr/bin/olv-air`, `air/olv-cam` to `/usr/bin/olv-cam`; bench tool:
 `tools/flrc_bench` to `/usr/bin/flrc_bench`.) Reflash only when the boot
 scripts, the SDK image or the GUI change.
 
@@ -268,21 +274,26 @@ config changes made on the board are lost unless you also put them into
 | Path | |
 |---|---|
 | `/usr/bin/olv-air`, `olv-vrxd`, `flrc_bench` | our programs (static C++ runtime, uClibc) |
+| `/usr/bin/olv-cam` | camera -> H.265 (Rockchip MPI; uses the stock `/oem/usr/lib` media libraries), started by `olv-air` |
 | `/usr/bin/olv-run` | runs the role's program and restarts it if it exits |
-| `/etc/olv.conf` | `role=air` / `vrx`, `enabled`, air `mode`, `bind`, `source`, `air_args`, `vrx_args` |
+| `/etc/olv.conf` | `role=air` / `vrx`, `enabled`, air `mode`, `bind`, `source` (`camera`, `testcard` or an .ivf), `camera_args`, `air_args`, `vrx_args` |
 | `/etc/olv-radio.conf` | radio module, pins, power (from `conf/olv-radio-<radio>.conf`) |
 | `/etc/vrx.conf` | VRX `id`, `band`, `mode`, `bind` |
 | `/etc/luckfox.cfg` | turns on SPI0 through Luckfox's `luckfox-config load` at boot |
 | `/etc/init.d/S99olv` | starts `olv-run` (after `S99luckfoxconfigload` has enabled SPI) |
 | `/etc/init.d/S99usb0config` | replaces the stock one: VRX `10.55.<id>.1` + DHCP, air `172.32.0.93` |
-| `/usr/share/olv/testcard-<mode>.ivf` | the test card the air unit loops (`source=testcard`) |
+| `/usr/share/olv/nocamera-<mode>.ivf` | looped while the camera is missing or restarting |
+| `/usr/share/olv/testcard-<mode>.ivf` | the test card (`source=testcard`) |
+| `/oem/usr/share/iqfiles/` | rkaiq IQ files of the supported sensors |
 | `/usr/share/olv/www/` | the GUI, served by vrxd on port 8080 |
 | `/etc/olv-build` | git version and build options |
 | `/var/log/olv.log` | program output (in RAM; rotated at 256 KB) |
 
 Rockchip's `rkipc` camera app, which the stock image starts from
 `/oem/usr/bin/RkLunch.sh`, is kept off when `/etc/olv.conf` exists (it would
-hold the camera); the kernel modules `RkLunch.sh` loads are still loaded.
+hold the camera); the kernel modules `RkLunch.sh` loads (sensor drivers, ISP,
+encoder) are still loaded. The kernel gets the SC4336 and SC530AI drivers on
+top of the stock SC3336 one (`olv-camera.config`).
 
 ### 6.2 Files in this directory
 
@@ -308,6 +319,7 @@ hold the camera); the kernel modules `RkLunch.sh` loads are still loaded.
 | No `/dev/spidev0.0` | `cat /etc/luckfox.cfg`; run `luckfox-config load` and look for errors; `luckfox-config` can also enable SPI0 interactively |
 | `olv.log`: RadioLib error -2 (chip not found) or SPI errors | wiring, module power, `spidev`/pins in `/etc/olv-radio.conf`; `cat /sys/kernel/debug/pinctrl/*/pinmux-pins` to see that the GPIOs are free |
 | `olv.log`: `refusing ... without --outdoor` | power above 0 dBm at the chip: lower `power_dbm`, or `air_args=--outdoor` outdoors only |
+| `olv.log`: `camera: stopped ... after 0 frames`, GUI shows NO CAMERA | `olv-cam --list` (sensor bound?), `dmesg \| grep -iE "sc3336\|sc4336\|sc530ai\|rkisp"`, ribbon cable seated; the olv-cam error just above the line says which step failed ([docs/camera.md](../docs/camera.md)) |
 | GUI loads but shows no picture | Chrome flag (4.3); is the air unit transmitting (4.4)? `curl http://10.55.1.1:8080/api/stats` shows `sync` and packet counts |
 
 When something fails, paste the command, its output, `/etc/olv-build` and

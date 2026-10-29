@@ -53,6 +53,7 @@ struct receiver {
 
 struct opts {
     const char *input;
+    const char *label; // text drawn over the picture (the board's NO CAMERA card)
     const char *out_dir;
     const char *bind;
     const struct olv_mode *mode;
@@ -77,6 +78,7 @@ static void usage(void) {
             "usage: loopback [options]\n"
             "  --mode lr520|lr260|hq2600|hq1300   link preset (default lr520)\n"
             "  --input FILE        source clip (default: ffmpeg testsrc2)\n"
+            "  --label TEXT        draw TEXT over the picture (needs ffmpeg with drawtext)\n"
             "  --size WxH --fps N  override the preset picture\n"
             "  --seconds S         clip length (default 10)\n"
             "  --kbps N            video CBR target (default: 85%% of link capacity)\n"
@@ -108,10 +110,18 @@ static bool safe_path(const char *s) {
 
 static uint8_t *run_encoder(const struct opts *o, int slices, size_t *out_len) {
     char src[1024];
+    char label[512] = "";
+    if (o->label)
+        snprintf(label, sizeof(label),
+                 "%sdrawtext=text='%s':fontcolor=white:fontsize=h/7:box=1:boxcolor=black@0.7:"
+                 "boxborderw=h/40:x=(w-tw)/2:y=(h-th)/2",
+                 o->input ? "," : " -vf \"", o->label);
     if (o->input)
-        snprintf(src, sizeof(src), "-i '%s' -vf scale=%d:%d,fps=%d", o->input, o->w, o->h, o->fps);
+        snprintf(src, sizeof(src), "-i '%s' -vf \"scale=%d:%d,fps=%d%s\"", o->input, o->w, o->h,
+                 o->fps, label);
     else
-        snprintf(src, sizeof(src), "-f lavfi -i testsrc2=size=%dx%d:rate=%d", o->w, o->h, o->fps);
+        snprintf(src, sizeof(src), "-f lavfi -i testsrc2=size=%dx%d:rate=%d%s%s", o->w, o->h,
+                 o->fps, label, o->label ? "\"" : "");
     int keyint = (int)lround(o->refresh_s * o->fps);
     if (keyint < 2)
         keyint = 2;
@@ -328,6 +338,7 @@ int main(int argc, char **argv) {
     enum {
         O_MODE = 256,
         O_INPUT,
+        O_LABEL,
         O_SIZE,
         O_FPS,
         O_SEC,
@@ -350,6 +361,7 @@ int main(int argc, char **argv) {
     };
     static const struct option lo[] = {{"mode", 1, 0, O_MODE},
                                        {"input", 1, 0, O_INPUT},
+                                       {"label", 1, 0, O_LABEL},
                                        {"size", 1, 0, O_SIZE},
                                        {"fps", 1, 0, O_FPS},
                                        {"seconds", 1, 0, O_SEC},
@@ -382,6 +394,9 @@ int main(int argc, char **argv) {
             break;
         case O_INPUT:
             o.input = optarg;
+            break;
+        case O_LABEL:
+            o.label = optarg;
             break;
         case O_SIZE:
             if (sscanf(optarg, "%dx%d", &w, &h) != 2) {
@@ -475,8 +490,9 @@ int main(int argc, char **argv) {
         o.rx_spec[1] = "loss=0.2,seed=2";
         o.n_rx = 2;
     }
-    if (!safe_path(o.out_dir) || (o.input && !safe_path(o.input))) {
-        fprintf(stderr, "paths must not contain single quotes\n");
+    if (!safe_path(o.out_dir) || (o.input && !safe_path(o.input)) ||
+        (o.label && (!safe_path(o.label) || strpbrk(o.label, ":\\%\"$`")))) {
+        fprintf(stderr, "paths must not contain single quotes; labels no ' : \\ %% \" $ or `\n");
         return 2;
     }
     if (o.k < 1 || o.n < o.k || o.n > FEC_MAX_N || o.cr < 2 || o.cr > 5 || o.fps < 1 ||
