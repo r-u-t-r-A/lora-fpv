@@ -128,3 +128,14 @@ records `type u8 | len u16 | payload`:
 | 5 LOG | UTF-8 text |
 
 Configuration uses `GET/POST /api/config` (JSON) on the same VRX.
+
+## 5. Open issues
+
+- FLRC timing constants in `common/airtime.h` are guesses until M0.
+- Link capacity is below the CBR targets in CLAUDE.md (see
+  `docs/reports/2026-10-29-sim-loopback.md`).
+- WebCodecs requires a key frame after `configure()`. With column intra
+  refresh there is only one IDR, so a GUI that starts late (or rebuilds its
+  decoder after an error) marks the next complete frame carrying parameter
+  sets as "key". Whether Chrome's HEVC decoder accepts that has to be tested
+  in M3; the libde265 WASM fallback has no such restriction.

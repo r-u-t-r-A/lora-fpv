@@ -26,3 +26,8 @@ add_subdirectory(third_party)
 add_subdirectory(common)
 add_subdirectory(sim)
 add_subdirectory(vrx)
+
+# Compile the browser's WASM glue on the host too, so warnings fail CI early.
+add_library(olv_wasm_check OBJECT web/wasm/olv_wasm.c)
+target_compile_options(olv_wasm_check PRIVATE ${OLV_WARNINGS})
+target_link_libraries(olv_wasm_check PRIVATE olv_common)

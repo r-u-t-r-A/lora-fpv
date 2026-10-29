@@ -26,6 +26,26 @@ ctest --test-dir build --output-on-failure
 Needs CMake >= 3.16 and a C11 compiler. `sim/loopback` also needs `ffmpeg`
 with libx265 on the PATH.
 
+## Simulator
+
+```sh
+./build/sim/loopback --mode lr520 --mp4      # x265 -> FEC -> hopping -> 2 lossy RX -> merge -> decode
+./build/sim/loopback --help                  # loss models, FEC shape, modes
+```
+
+Prints link budget, per-receiver PER, picture quality against a lossless
+decode, and the M2 gate; `--mp4` writes a side-by-side comparison.
+
+## Web GUI
+
+```sh
+cd web && npm ci
+npm run wasm        # needs Emscripten (emcc); CI builds it
+npm test && npm run build
+../sim/fake_vrx.sh  # two fake VRXs replaying a simulated flight
+npm run dev         # open the URL fake_vrx.sh prints
+```
+
 ## Licence
 
 Code: GPL-3.0-or-later (`LICENSE`). Hardware: CERN-OHL-S. Third-party

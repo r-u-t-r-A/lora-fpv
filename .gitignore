@@ -12,8 +12,8 @@
 !sim/clips/.keep
 node_modules/
 web/dist/
-web/src/wasm/*.js
-web/src/wasm/*.wasm
+web/.test-out/
+web/public/olv.wasm
 __pycache__/
 .vscode/
 .cache/

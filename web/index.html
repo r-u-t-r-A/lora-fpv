@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>open-lr-video</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; background: #0b0d10; color: #d8dde3; }
+      main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(280px, 1fr); gap: 12px; padding: 12px; }
+      #video { width: 100%; aspect-ratio: 16 / 9; background: #111; display: block; }
+      table { border-collapse: collapse; font-size: 12px; width: 100%; }
+      th, td { padding: 2px 6px; border-bottom: 1px solid #222; text-align: right; }
+      th:first-child, td:first-child { text-align: left; }
+      #stats p { font-size: 12px; margin: 6px 0; }
+      #log { font-size: 11px; max-height: 40vh; overflow: auto; white-space: pre-wrap; color: #9aa4ae; }
+      @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <canvas id="video" width="640" height="360"></canvas>
+      <aside>
+        <div id="stats"></div>
+        <pre id="log"></pre>
+      </aside>
+    </main>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

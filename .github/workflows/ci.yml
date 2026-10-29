@@ -21,3 +21,35 @@ jobs:
         run: ninja -C build
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.10
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ffmpeg
+      - name: Simulator capture for the WASM test
+        run: |
+          cmake -S . -B build -G Ninja
+          ninja -C build loopback
+          ./build/sim/loopback --seconds 4 --out build/cap
+      - name: Build WASM
+        working-directory: web
+        run: npm ci && npm run wasm
+      - name: Typecheck, test, build
+        working-directory: web
+        env:
+          OLV_VRXLOG: ${{ github.workspace }}/build/cap
+        run: npm run typecheck && npm test && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist

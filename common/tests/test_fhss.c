@@ -20,8 +20,7 @@ static void test_every_channel_once(void) {
     }
 }
 
-// Vectors from an independent Python implementation (see docs/protocol.md);
-// web/src/fhss.ts checks the same ones.
+// Vectors from an independent Python implementation (see docs/protocol.md).
 static void test_reference_vectors(void) {
     uint32_t seed = fhss_seed("open-lr-video");
     CHECK(seed == 0xf53d2da0u);
