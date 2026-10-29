@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// M0 bench tool: FLRC on a fixed channel between two Luckfox + LR2021 boards.
+// M0 bench tool: FLRC on a fixed channel between two Luckfox boards with
+// LR2021 (default) or SX1280 (--chip sx1280, or --module e28-2g4m27s) radios.
 //
 //   flrc_bench tx     send numbered packets
 //   flrc_bench rx     receive, log CSV per packet, PER and RSSI per second
@@ -7,9 +8,9 @@
 //   flrc_bench pong   echo every good packet straight back
 //   flrc_bench retune time retune and calibration (no RF needed)
 //
-// RF safety: the NiceRF module has an external PA, so the module output is
-// well above the LR2021 setting. Bench runs use the lowest power, with 30-40
-// dB of attenuation between the modules and never without antenna or load.
+// RF safety: the NiceRF and E28 modules have external PAs, so the module
+// output is well above the chip setting (E28: about +25 dB). Bench runs use the lowest power, with
+// 30-40 dB of attenuation between the modules and never without antenna or load.
 // --power above 0 dBm is refused unless --outdoor is given.
 #define _POSIX_C_SOURCE 200809L
 
@@ -25,6 +26,7 @@
 #include "fhss.h"
 #include "olv_util.h"
 #include "radio.h"
+#include "radio_conf.h"
 
 #define MAGIC 0x424C564Fu // "OLVB"
 
@@ -45,25 +47,30 @@ struct opts {
 };
 
 static void usage(void) {
-    fprintf(stderr, "usage: flrc_bench MODE --busy N --irq N --nreset N [options]\n"
-                    "  MODE                tx | rx | ping | pong | retune\n"
-                    "  --spidev PATH       default /dev/spidev0.0\n"
-                    "  --spi-hz N          default 8000000\n"
-                    "  --busy/--irq/--nreset N   GPIO numbers (bank*32+line, see docs/wiring.md)\n"
-                    "  --rf-pins A,B,C     module PA/LNA control GPIOs (-1 = none)\n"
-                    "  --rf-table S,R,T,RH,TH   pin levels per mode as bitmasks (stby, rx, tx,\n"
-                    "                      rx 2.4G, tx 2.4G), from the module datasheet\n"
-                    "  --tcxo-mv N         TCXO voltage on DIO3, 0 for a crystal (default 0)\n"
-                    "  --freq HZ           default 868000000\n"
-                    "  --bitrate BPS       default 520000 (2600000 ... 260000)\n"
-                    "  --cr N              2=1/2 3=3/4 4=uncoded 5=2/3 (default 3)\n"
-                    "  --power DBM         LR2021 output (default -9); > 0 needs --outdoor\n"
-                    "  --outdoor           allow > 0 dBm (antennas fitted, outdoors only)\n"
-                    "  --len N             packet length incl. 12-byte bench header (default 255)\n"
-                    "  --count N           packets to send (default 1000, 0 = until Ctrl-C)\n"
-                    "  --interval-ms N     gap between packets (default 10)\n"
-                    "  --timeout-ms N      ping: wait for echo (default 100)\n"
-                    "  --csv FILE          rx/ping: per-packet log\n");
+    fprintf(stderr,
+            "usage: flrc_bench MODE --busy N --irq N --nreset N [options]\n"
+            "  MODE                tx | rx | ping | pong | retune\n"
+            "  --chip NAME         lr2021 (default) | sx1280\n"
+            "  --module NAME       preset: e28-2g4m27s (SX1280, TXEN/RXEN table, gains,\n"
+            "                      power limit); give it first, later options override\n"
+            "  --spidev PATH       default /dev/spidev0.0\n"
+            "  --spi-hz N          default 8000000\n"
+            "  --busy/--irq/--nreset N   GPIO numbers (bank*32+line, see docs/wiring.md)\n"
+            "  --rf-pins A,B,C     module PA/LNA control GPIOs (-1 = none; E28: TXEN,RXEN)\n"
+            "  --rf-table S,R,T,RH,TH   pin levels per mode as bitmasks (stby, rx, tx,\n"
+            "                      rx 2.4G, tx 2.4G), from the module datasheet\n"
+            "  --tcxo-mv N         TCXO voltage on DIO3, 0 for a crystal (default 0)\n"
+            "  --freq HZ           default 868000000 (2440000000 on the SX1280)\n"
+            "  --bitrate BPS       default 520000 (1300000 on the SX1280)\n"
+            "  --cr N              2=1/2 3=3/4 4=uncoded 5=2/3 (default 3)\n"
+            "  --power DBM         chip output (default -9, E28 preset -18); > 0 needs --outdoor\n"
+            "  --outdoor           allow > 0 dBm (antennas fitted, outdoors only)\n"
+            "  --len N             packet length incl. 12-byte bench header (default: the\n"
+            "                      chip's maximum, 255 LR2021 / 127 SX1280)\n"
+            "  --count N           packets to send (default 1000, 0 = until Ctrl-C)\n"
+            "  --interval-ms N     gap between packets (default 10)\n"
+            "  --timeout-ms N      ping: wait for echo (default 100)\n"
+            "  --csv FILE          rx/ping: per-packet log\n");
 }
 
 static uint32_t now_us(void) {
@@ -322,8 +329,8 @@ int main(int argc, char **argv) {
                               .irq = -1,
                               .nreset = -1,
                               .rf_pin = {-1, -1, -1}},
-                     .flrc = {.freq_hz = 868000000u,
-                              .bitrate_bps = 520000,
+                     .flrc = {.freq_hz = 0,
+                              .bitrate_bps = 0,
                               .cr = 3,
                               .preamble_bits = 32,
                               .sync_word = 0x2D014B1Du,
@@ -331,7 +338,7 @@ int main(int argc, char **argv) {
                               .power_dbm = -9,
                               .tcxo_mv = 0},
                      .count = 1000,
-                     .len = 255,
+                     .len = 0,
                      .interval_ms = 10,
                      .timeout_ms = 100};
     enum {
@@ -352,7 +359,9 @@ int main(int argc, char **argv) {
         O_COUNT,
         O_INTERVAL,
         O_TIMEOUT,
-        O_CSV
+        O_CSV,
+        O_CHIP,
+        O_MODULE
     };
     static const struct option lo[] = {{"spidev", 1, 0, O_SPIDEV},
                                        {"spi-hz", 1, 0, O_SPIHZ},
@@ -372,9 +381,11 @@ int main(int argc, char **argv) {
                                        {"interval-ms", 1, 0, O_INTERVAL},
                                        {"timeout-ms", 1, 0, O_TIMEOUT},
                                        {"csv", 1, 0, O_CSV},
+                                       {"chip", 1, 0, O_CHIP},
+                                       {"module", 1, 0, O_MODULE},
                                        {"help", 0, 0, 'h'},
                                        {0, 0, 0, 0}};
-    int c, tbl[RADIO_RF_MODES];
+    int c, chip, tbl[RADIO_RF_MODES];
     while ((c = getopt_long(argc, argv, "h", lo, NULL)) != -1) {
         switch (c) {
         case O_SPIDEV:
@@ -433,6 +444,19 @@ int main(int argc, char **argv) {
         case O_CSV:
             o.csv = optarg;
             break;
+        case O_CHIP:
+            if ((chip = radio_chip_parse(optarg)) < 0) {
+                fprintf(stderr, "unknown chip %s\n", optarg);
+                return 2;
+            }
+            o.pins.chip = (enum radio_chip)chip;
+            break;
+        case O_MODULE:
+            if (radio_conf_module(optarg, &o.pins, &o.flrc)) {
+                fprintf(stderr, "unknown module %s\n", optarg);
+                return 2;
+            }
+            break;
         default:
             usage();
             return c == 'h' ? 0 : 2;
@@ -454,18 +478,31 @@ int main(int argc, char **argv) {
                 o.flrc.power_dbm);
         return 2;
     }
-    if (o.len < 12 || o.len > 255) {
-        fprintf(stderr, "--len must be 12..255\n");
+    const struct radio_caps *caps = radio_chip_caps(o.pins.chip);
+    if (!o.flrc.freq_hz)
+        o.flrc.freq_hz = caps->sub_ghz ? 868000000u : 2440000000u;
+    if (!o.flrc.bitrate_bps)
+        o.flrc.bitrate_bps = caps->sub_ghz ? 520000 : 1300000;
+    if (!o.len)
+        o.len = caps->max_packet;
+    if (o.len < 12 || o.len > caps->max_packet) {
+        fprintf(stderr, "--len must be 12..%u on the %s\n", caps->max_packet, caps->name);
         return 2;
     }
+    if (o.pins.pa_gain_db)
+        printf("module output ~%+d dBm (chip %d dBm + PA %d dB): keep >= %d dB of attenuation "
+               "between the modules on the bench\n",
+               radio_conf_port_dbm(&o.pins, o.flrc.power_dbm), o.flrc.power_dbm, o.pins.pa_gain_db,
+               radio_conf_port_dbm(&o.pins, o.flrc.power_dbm) + 40);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
     struct radio *r = radio_open(&o.pins, &o.flrc);
     if (!r)
         return 1;
-    printf("LR2021 up: %.3f MHz, FLRC %u bit/s, CR code %u, %d dBm at the chip, %u-byte packets\n",
-           o.flrc.freq_hz / 1e6, o.flrc.bitrate_bps, o.flrc.cr, o.flrc.power_dbm, o.len);
+    printf("%s up: %.3f MHz, FLRC %u bit/s, CR code %u, %d dBm at the chip, %u-byte packets\n",
+           caps->name, o.flrc.freq_hz / 1e6, o.flrc.bitrate_bps, o.flrc.cr, o.flrc.power_dbm,
+           o.len);
     int rc;
     if (!strcmp(o.mode, "tx"))
         rc = run_tx(r, &o);

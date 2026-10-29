@@ -1,4 +1,4 @@
-# M0 bench bring-up: FLRC between two Luckfox + LR2021 boards
+# M0 bench bring-up: FLRC between two Luckfox + LR2021 (or E28) boards
 
 Goal (CLAUDE.md, M0): FLRC packets on 868 MHz and 2.4 GHz between two
 modules, sensitivity per bit rate measured through an attenuator, logged in
@@ -87,3 +87,39 @@ until PER passes 1 %, 10 %, 50 %. Note the attenuator value and the RSSI that
 With `--interval-ms 0` the mean start-to-TX-done time is airtime plus
 per-packet overhead; two lengths separate the two. That gives the
 `tx_gap_us` and bit-count constants in `common/airtime.h`.
+
+## 8. Ebyte E28-2G4M27S (SX1280) boards
+
+Only if you build SX1280 boards; wiring in `docs/wiring.md`. Below,
+`E28` stands for
+`--module e28-2g4m27s --busy N --irq N(DIO1) --nreset N --rf-pins TXEN,RXEN`
+(the preset first, so later options override it).
+
+**RF safety:** the E28's PA adds about 25 dB, so even the lowest chip
+setting (-18 dBm, the preset default) gives about **+7 dBm** at the antenna
+port. That is above the CLAUDE.md bench limit of 0 dBm, and the tool says
+so. Use at least 47 dB of attenuation between the two modules (e.g. 30 + 20
+dB) and check the attenuators' rating. Never transmit with the port open.
+
+1. Without RF, on each board:
+   `./flrc_bench retune E28 --count 1000`
+   Expect `sx1280 up: 2440.000 MHz, FLRC 1300000 bit/s ...` and the retune
+   time.
+2. With a multimeter or logic probe on TXEN/RXEN: run
+   `./flrc_bench rx E28` (Ctrl-C to stop) and note the levels
+   (expect RXEN high, TXEN low); then `./flrc_bench tx E28 --count 0` (TXEN
+   high, RXEN low). Paste both.
+3. Link: Board B `./flrc_bench rx E28 --csv rx.csv`, Board A
+   `./flrc_bench tx E28 --count 2000`. Expect `--len` 127 by default and close
+   to 0 % PER. If B receives the first packet and then nothing, continuous
+   RX does not survive RX_DONE: paste the output.
+4. Ping-pong: B `./flrc_bench pong E28`, A
+   `./flrc_bench ping E28 --count 500 --csv ping.csv`.
+5. Timing: A `./flrc_bench tx E28 --len 127 --interval-ms 0 --count 2000`
+   and `--len 64`; paste both (airtime model for the SX1280).
+6. Sensitivity, as in section 6, at `--bitrate 1300000` (`--cr 3`, `--cr 4`)
+   and, for reference, `--bitrate 650000`. Note that `rx` prints RSSI with
+   the preset's 12 dB LNA gain already subtracted.
+7. If you have a power meter or a calibrated SDR behind the attenuators:
+   the received power at `--power -18` and `--power -9` gives the real PA
+   gain (preset: 25 dB).

@@ -1,4 +1,4 @@
-foreach(t test_ota test_vrx_proto test_fhss test_fec test_h265 test_vpkt test_airsched)
+foreach(t test_ota test_vrx_proto test_fhss test_fec test_h265 test_vpkt test_airsched test_radio_caps)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE olv_common)
     target_compile_options(${t} PRIVATE ${OLV_WARNINGS})
