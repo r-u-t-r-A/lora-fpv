@@ -315,6 +315,29 @@ static void test_timeout(void) {
     vpkt_tx_free(&tx);
 }
 
+static void test_restart(void) {
+    static uint8_t au[4096];
+    struct vpkt_tx tx;
+    struct vpkt_tx_cfg c = tx_cfg();
+    REQUIRE(vpkt_tx_init(&tx, &c) == 0);
+    struct vpkt_rx *rx = new_rx();
+    size_t len = make_au(au, 8, 1, 400, 0);
+    tx.frame = 5000;
+    send_frame(&tx, au, len);
+    for (int j = 0; j < n_pkts; j++)
+        vpkt_rx_push(rx, pkts[j].b, pkts[j].len, 0);
+    tx.frame = 0; // air unit rebooted
+    send_frame(&tx, au, len);
+    CHECK(vpkt_rx_push(rx, pkts[0].b, pkts[0].len, 0) == VPKT_NEW);
+    for (int j = 1; j < n_pkts; j++)
+        vpkt_rx_push(rx, pkts[j].b, pkts[j].len, 0);
+    vpkt_rx_flush(rx);
+    REQUIRE(n_outs == 2);
+    CHECK(outs[1].info.frame == 0 && outs[1].info.complete);
+    CHECK(rx->st.restarts == 1);
+    vpkt_tx_free(&tx);
+}
+
 int main(void) {
     T_RUN(test_roundtrip_sizes);
     T_RUN(test_small_block_shrinks_k);
@@ -323,6 +346,7 @@ int main(void) {
     T_RUN(test_two_receivers_merge);
     T_RUN(test_dup_late_lost_order);
     T_RUN(test_timeout);
+    T_RUN(test_restart);
     fec_free_cache();
     T_DONE();
 }

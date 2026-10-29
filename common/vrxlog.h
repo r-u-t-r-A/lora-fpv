@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Packet capture of one receiver, for replay to the GUI (sim/fake_vrx).
+// Packet capture of one receiver (sim/loopback writes them, vrxd --replay
+// plays them to the GUI).
 //   file:   "OLVL" | version u32 (1)
 //   record: t_us u64 (capture time) | len u16 | vrx_rx_packet bytes[len]
 #ifndef OLV_SIM_VRXLOG_H

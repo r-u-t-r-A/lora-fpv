@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// VRX daemon: receives OTA packets and streams them to the browser GUI.
+// Backends:
+//   --replay FILE   play a sim/loopback packet log in real time (laptop GUI work)
+//   (radio)         LR2021 via common/radio.h: not built yet (M0/M1)
+#define _POSIX_C_SOURCE 200809L
+
+#include <getopt.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "fhss.h"
+#include "httpd.h"
+#include "olv_util.h"
+#include "ota.h"
+#include "vrx_proto.h"
+#include "vrxlog.h"
+
+struct vrx_conf {
+    int id;
+    char band[8];  // "868" or "2400"
+    char mode[16]; // lr520 lr260 hq2600 hq1300
+    char bind[64];
+};
+
+struct replay {
+    uint8_t *data;
+    size_t len, pos;
+    uint64_t t0_log, t0_wall;
+    bool loop;
+    double speed;
+    uint32_t loops;
+};
+
+struct vrxd {
+    struct vrx_conf conf;
+    const char *conf_path;
+    struct httpd *http;
+    struct replay rp;
+    struct vrx_status st;
+    uint64_t start_us;
+};
+
+static volatile sig_atomic_t stop;
+
+static void on_signal(int sig) {
+    (void)sig;
+    stop = 1;
+}
+
+static uint64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+// ------------------------------------------------------------------ config
+
+static void conf_defaults(struct vrx_conf *c) {
+    c->id = 1;
+    snprintf(c->band, sizeof(c->band), "868");
+    snprintf(c->mode, sizeof(c->mode), "lr520");
+    snprintf(c->bind, sizeof(c->bind), "open-lr-video");
+}
+
+static void conf_set(struct vrx_conf *c, const char *k, const char *v) {
+    if (!strcmp(k, "id"))
+        c->id = atoi(v);
+    else if (!strcmp(k, "band"))
+        snprintf(c->band, sizeof(c->band), "%s", v);
+    else if (!strcmp(k, "mode"))
+        snprintf(c->mode, sizeof(c->mode), "%s", v);
+    else if (!strcmp(k, "bind"))
+        snprintf(c->bind, sizeof(c->bind), "%s", v);
+}
+
+// /etc/vrx.conf: key=value lines, # comments.
+static void conf_load(struct vrx_conf *c, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl)
+            *nl = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq)
+            continue;
+        *eq = 0;
+        conf_set(c, line, eq + 1);
+    }
+    fclose(f);
+}
+
+static int conf_save(const struct vrx_conf *c, const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "id=%d\nband=%s\nmode=%s\nbind=%s\n", c->id, c->band, c->mode, c->bind);
+    return fclose(f);
+}
+
+static bool valid_mode(const char *m) {
+    return !strcmp(m, "lr520") || !strcmp(m, "lr260") || !strcmp(m, "hq2600") ||
+           !strcmp(m, "hq1300");
+}
+
+// Extracts "key": "string" or "key": number from a flat JSON object.
+static bool json_get(const char *body, const char *key, char *out, size_t cap) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(body, pat);
+    if (!p)
+        return false;
+    p = strchr(p + strlen(pat), ':');
+    if (!p)
+        return false;
+    p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    size_t n = 0;
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"' && n + 1 < cap) {
+            if (*p == '\\' && p[1])
+                p++;
+            out[n++] = *p++;
+        }
+    } else {
+        while (*p && (*p == '-' || (*p >= '0' && *p <= '9')) && n + 1 < cap)
+            out[n++] = *p++;
+    }
+    out[n] = 0;
+    return n > 0;
+}
+
+static void json_escape(const char *in, char *out, size_t cap) {
+    size_t n = 0;
+    for (; *in && n + 3 < cap; in++) {
+        if (*in == '"' || *in == '\\')
+            out[n++] = '\\';
+        if ((unsigned char)*in >= 0x20)
+            out[n++] = *in;
+    }
+    out[n] = 0;
+}
+
+static int api(void *ctx, const char *method, const char *path, const char *body, size_t body_len,
+               char *resp, size_t cap) {
+    struct vrxd *d = ctx;
+    (void)body_len;
+    if (strcmp(path, "/api/config") != 0) {
+        snprintf(resp, cap, "{\"error\":\"unknown endpoint\"}");
+        return 404;
+    }
+    if (!strcmp(method, "POST")) {
+        struct vrx_conf c = d->conf;
+        char v[64];
+        if (json_get(body, "band", v, sizeof(v)))
+            conf_set(&c, "band", v);
+        if (json_get(body, "mode", v, sizeof(v)))
+            conf_set(&c, "mode", v);
+        if (json_get(body, "bind", v, sizeof(v)))
+            conf_set(&c, "bind", v);
+        if (json_get(body, "id", v, sizeof(v)))
+            conf_set(&c, "id", v);
+        if (!valid_mode(c.mode) || (strcmp(c.band, "868") && strcmp(c.band, "2400")) || c.id < 1 ||
+            c.id > 254) {
+            snprintf(resp, cap, "{\"error\":\"invalid band, mode or id\"}");
+            return 400;
+        }
+        d->conf = c;
+        if (d->conf_path && conf_save(&d->conf, d->conf_path) != 0) {
+            snprintf(resp, cap, "{\"error\":\"could not save config\"}");
+            return 500;
+        }
+        // The radio backend re-reads this on its next acquisition cycle.
+    }
+    char bind[160];
+    json_escape(d->conf.bind, bind, sizeof(bind));
+    snprintf(resp, cap,
+             "{\"id\":%d,\"band\":\"%s\",\"mode\":\"%s\",\"bind\":\"%s\",\"link_id\":%u,"
+             "\"backend\":\"%s\",\"clients\":%u}",
+             d->conf.id, d->conf.band, d->conf.mode, bind, ota_link_id(d->conf.bind),
+             d->rp.data ? "replay" : "radio", httpd_ws_clients(d->http));
+    return 200;
+}
+
+// ------------------------------------------------------------------ replay
+
+static int replay_open(struct replay *r, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror(path);
+        return -1;
+    }
+    if (!vrxlog_check_header(f)) {
+        fprintf(stderr, "%s: not a vrxlog file\n", path);
+        fclose(f);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 8, SEEK_SET);
+    r->len = (size_t)(sz - 8);
+    r->data = malloc(r->len);
+    if (!r->data || fread(r->data, 1, r->len, f) != r->len) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    r->pos = 0;
+    r->t0_wall = 0;
+    return 0;
+}
+
+// Sends every record that is due, batched into WebSocket messages.
+static void replay_step(struct vrxd *d, uint64_t now) {
+    struct replay *r = &d->rp;
+    uint8_t msg[VRX_MSG_MAX];
+    size_t msg_len = 0;
+    for (;;) {
+        if (r->pos + 10 > r->len) {
+            if (!r->loop)
+                break;
+            r->pos = 0;
+            r->t0_wall = 0;
+            r->loops++;
+        }
+        const uint8_t *p = r->data + r->pos;
+        uint64_t t = olv_get_u32(p) | ((uint64_t)olv_get_u32(p + 4) << 32);
+        uint16_t len = olv_get_u16(p + 8);
+        if (r->pos + 10 + len > r->len) {
+            r->pos = r->len;
+            continue;
+        }
+        if (!r->t0_wall) {
+            r->t0_wall = now;
+            r->t0_log = t;
+        }
+        uint64_t due = r->t0_wall + (uint64_t)((double)(t - r->t0_log) / r->speed);
+        if (due > now)
+            break;
+        size_t nl = vrx_rec_append(msg, msg_len, sizeof(msg), VRX_REC_RX_PACKET, p + 10, len);
+        if (!nl) {
+            httpd_ws_broadcast(d->http, msg, msg_len);
+            msg_len = 0;
+            continue;
+        }
+        msg_len = nl;
+        d->st.pkts_ok++;
+        struct vrx_rx_packet rx;
+        if (vrx_rx_packet_unpack(p + 10, len, &rx) == 0)
+            d->st.hop = rx.hop;
+        r->pos += 10u + len;
+    }
+    if (msg_len)
+        httpd_ws_broadcast(d->http, msg, msg_len);
+}
+
+static void send_status(struct vrxd *d, uint64_t now) {
+    d->st.vrx_id = (uint8_t)d->conf.id;
+    d->st.band = strcmp(d->conf.band, "2400") == 0;
+    d->st.sync_state = d->rp.data ? FHSS_RX_LOCKED : FHSS_RX_PARKED;
+    d->st.pkts_drop = httpd_ws_dropped(d->http);
+    d->st.noise_dbm = INT16_MIN;
+    d->st.uptime_ms = (uint32_t)((now - d->start_us) / 1000u);
+    uint8_t pl[VRX_STATUS_LEN], msg[64];
+    vrx_status_pack(&d->st, pl);
+    size_t n = vrx_rec_append(msg, 0, sizeof(msg), VRX_REC_STATUS, pl, sizeof(pl));
+    httpd_ws_broadcast(d->http, msg, n);
+}
+
+static void usage(void) {
+    fprintf(stderr, "usage: vrxd [--config /etc/vrx.conf] [--listen ADDR] [--port 8080]\n"
+                    "            [--www DIR] [--id N] [--replay FILE [--loop] [--speed X]]\n");
+}
+
+int main(int argc, char **argv) {
+    static struct vrxd d;
+    conf_defaults(&d.conf);
+    const char *listen_addr = NULL, *www = NULL, *replay_path = NULL;
+    int port = 8080, id = 0;
+    d.rp.speed = 1.0;
+    static const struct option lo[] = {
+        {"config", 1, 0, 'c'}, {"listen", 1, 0, 'l'}, {"port", 1, 0, 'p'}, {"www", 1, 0, 'w'},
+        {"id", 1, 0, 'i'},     {"replay", 1, 0, 'r'}, {"loop", 0, 0, 'L'}, {"speed", 1, 0, 's'},
+        {"help", 0, 0, 'h'},   {0, 0, 0, 0}};
+    int c;
+    while ((c = getopt_long(argc, argv, "c:l:p:w:i:r:Ls:h", lo, NULL)) != -1) {
+        switch (c) {
+        case 'c':
+            d.conf_path = optarg;
+            break;
+        case 'l':
+            listen_addr = optarg;
+            break;
+        case 'p':
+            port = atoi(optarg);
+            break;
+        case 'w':
+            www = optarg;
+            break;
+        case 'i':
+            id = atoi(optarg);
+            break;
+        case 'r':
+            replay_path = optarg;
+            break;
+        case 'L':
+            d.rp.loop = true;
+            break;
+        case 's':
+            d.rp.speed = atof(optarg);
+            break;
+        default:
+            usage();
+            return c == 'h' ? 0 : 2;
+        }
+    }
+    if (d.conf_path)
+        conf_load(&d.conf, d.conf_path);
+    if (id)
+        d.conf.id = id;
+    if (d.rp.speed <= 0)
+        d.rp.speed = 1.0;
+    if (!replay_path) {
+        fprintf(stderr, "vrxd: the LR2021 radio backend is not built yet; use --replay\n");
+        return 2;
+    }
+    if (replay_open(&d.rp, replay_path))
+        return 1;
+
+    struct httpd_cfg hc = {
+        .bind_addr = listen_addr, .port = (uint16_t)port, .www_root = www, .api = api, .ctx = &d};
+    d.http = httpd_open(&hc);
+    if (!d.http)
+        return 1;
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    fprintf(stderr, "vrxd %d: ws://%s:%d/rx, replaying %s%s\n", d.conf.id,
+            listen_addr ? listen_addr : "0.0.0.0", port, replay_path, d.rp.loop ? " (loop)" : "");
+
+    d.start_us = now_us();
+    uint64_t next_status = d.start_us;
+    while (!stop) {
+        if (httpd_poll(d.http, 2) < 0)
+            break;
+        uint64_t now = now_us();
+        // Do not burn through the log while nobody is watching.
+        if (httpd_ws_clients(d.http))
+            replay_step(&d, now);
+        else
+            d.rp.t0_wall = 0;
+        if (now >= next_status) {
+            send_status(&d, now);
+            next_status = now + 250000u;
+        }
+    }
+    httpd_close(d.http);
+    free(d.rp.data);
+    return 0;
+}

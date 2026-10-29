@@ -127,6 +127,7 @@ struct vpkt_rx_stats {
     uint32_t pkts, new_shards, dups, late, bad;
     uint32_t blocks_ok, blocks_lost;
     uint32_t frames_complete, frames_partial, frames_lost;
+    uint32_t restarts; // frame counter jumped far backwards
 };
 
 struct vpkt_rx {

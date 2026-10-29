@@ -364,6 +364,14 @@ enum vpkt_push vpkt_rx_push(struct vpkt_rx *rx, const uint8_t *pkt, size_t len, 
         rx->newest_frame = f;
     }
     int16_t d = (int16_t)(f - rx->next_frame);
+    if (d < -4 * VPKT_RX_FRAMES) {
+        // Far behind: the air unit restarted (or a replay looped). Start over.
+        vpkt_rx_flush(rx);
+        rx->next_frame = f;
+        rx->newest_frame = f;
+        rx->st.restarts++;
+        d = 0;
+    }
     if (d < 0) {
         rx->st.late++;
         return VPKT_LATE;
