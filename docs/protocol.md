@@ -42,10 +42,13 @@ Beacon and telemetry packets ignore `frame`/`block`/`shard`/`k`/`n`.
 | 9 | 1 | `tx_power` dBm, signed |
 | 10 | 2 | `offset_us`: hop start to start of this beacon's transmission |
 
-The air unit sends a beacon as the first packet of every hop. The header `hop`
-plus the beacon `cycle` let a parked receiver compute the full sequence, and
-the RX-done timestamp minus beacon airtime minus `offset_us` gives the hop
-start on the receiver's clock.
+The air unit sends a beacon as the first packet of every hop; in the HQ
+modes (40 channels) it sends a second one from mid-hop (`beacons_per_hop` =
+2 in `common/modes.h`), so one lost beacon does not cost a parked receiver a
+whole extra park period. The header `hop` plus the beacon `cycle` let a
+parked receiver compute the full sequence, and the RX-done timestamp minus
+beacon airtime minus `offset_us` gives the hop start on the receiver's clock
+(either beacon works; `offset_us` says where in the hop it was sent).
 
 ## 2. Video framing and FEC
 

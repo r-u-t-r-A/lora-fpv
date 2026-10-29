@@ -120,8 +120,9 @@ Hardware CRC on. A packet with a bad CRC is an erasure, never passed up.
 - Sequence: per cycle, a Fisher-Yates shuffle of the channel list driven by
   xorshift32 seeded with FNV-1a(bind phrase) XOR cycle number. Every channel
   appears once per cycle (ExpressLRS-style).
-- Beacon (type 2) is the first packet of every hop: cycle u32, hop_us, channel
-  count, FEC defaults, TX power, offset from hop start. The header `hop` field
+- Beacon (type 2) is the first packet of every hop (HQ: plus a second from
+  mid-hop): cycle u32, hop_us, channel count, FEC defaults, TX power, offset
+  from hop start. The header `hop` field
   is written at transmit time by the air scheduler.
 - RX acquisition: park on one channel until a beacon arrives (cycles are
   reshuffled, so worst case 2n-1 hops: 190 ms LR, 790 ms HQ), take cycle and

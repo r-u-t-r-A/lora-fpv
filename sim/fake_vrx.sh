@@ -24,7 +24,7 @@ urls=""
 i=1
 for log in "$dir"/rx*.vrxlog; do
     port=$((8080 + i))
-    "$build/vrx/vrxd" --replay "$log" --loop --listen 127.0.0.1 --port "$port" --id "$i" \
+    "$build/vrx/vrxd_sim" --replay "$log" --loop --listen 127.0.0.1 --port "$port" --id "$i" \
         --www "$root/web/dist" &
     pids="$pids $!"
     urls="$urls${urls:+,}ws://127.0.0.1:$port/rx"

@@ -37,7 +37,7 @@ void airsched_next(struct airsched *as, uint64_t now_us, struct airsched_action 
     while (now_us >= as->hop_start_us + c->hop_us) {
         as->hop_start_us += c->hop_us;
         as->abs_hop++;
-        as->beacon_done = false;
+        as->beacons_sent = 0;
         as->st.hops++;
         a->retune = true;
     }
@@ -49,9 +49,13 @@ void airsched_next(struct airsched *as, uint64_t now_us, struct airsched_action 
         return;
     }
 
-    bool want_beacon = !as->beacon_done && c->beacon_every && (as->abs_hop % c->beacon_every) == 0;
+    uint8_t per_hop = c->beacons_per_hop > 1 ? 2 : 1;
+    uint64_t mid = as->hop_start_us + c->hop_us / 2;
+    bool beacon_hop = c->beacon_every && (as->abs_hop % c->beacon_every) == 0;
+    bool want_beacon = beacon_hop && (as->beacons_sent == 0 ||
+                                      (as->beacons_sent == 1 && per_hop == 2 && now_us >= mid));
     if (want_beacon) {
-        as->beacon_done = true;
+        as->beacons_sent++;
         struct ota_hdr h = {.link_id = c->link_id,
                             .flags = ota_flags(OTA_TYPE_BEACON, (enum ota_mode)c->mode, 0)};
         struct ota_beacon b = {.cycle = airsched_cycle(as),
@@ -90,14 +94,18 @@ void airsched_next(struct airsched *as, uint64_t now_us, struct airsched_action 
             return;
         }
     }
-    // Nothing fits in this hop (or nothing to send): wait for the next hop.
-    a->wake_us = hop_end;
+    // Nothing fits in this hop (or nothing to send): wait for the next hop,
+    // or for mid-hop if the second beacon is still due.
+    a->wake_us =
+        (beacon_hop && per_hop == 2 && as->beacons_sent == 1 && now_us < mid) ? mid : hop_end;
 }
 
 size_t airsched_best_packet(const struct airsched_cfg *c, unsigned *per_hop, uint32_t *bps) {
     uint32_t avail = c->hop_us > c->retune_us ? c->hop_us - c->retune_us : 0;
     if (c->beacon_every == 1) {
         uint32_t b = flrc_airtime_us(&c->phy, OTA_HDR_LEN + OTA_BEACON_LEN) + c->phy.tx_gap_us;
+        if (c->beacons_per_hop > 1)
+            b *= 2;
         avail = avail > b ? avail - b : 0;
     }
     size_t best_len = 0;

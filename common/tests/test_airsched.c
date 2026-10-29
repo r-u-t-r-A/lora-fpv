@@ -129,10 +129,43 @@ static void test_print_capacity(void) {
     }
 }
 
+static void test_two_beacons_per_hop(void) {
+    struct airsched_cfg c = cfg_for(2600000, 40);
+    c.beacons_per_hop = 2;
+    airsched_init(&as, &c, 0);
+    uint8_t pkt[OTA_MAX_PACKET] = {0};
+    olv_put_u16(pkt, 0x1111);
+    pkt[10] = pkt[11] = 1;
+    uint64_t now = 0;
+    struct airsched_action a;
+    unsigned beacons[20] = {0};
+    bool late_second = true;
+    // First 10 hops busy (queue kept full), next 10 idle.
+    while (now < 200000) {
+        while (now < 100000 && airsched_queued(&as) < 4)
+            airsched_enqueue(&as, pkt, sizeof(pkt));
+        airsched_next(&as, now, &a);
+        if (!a.send) {
+            now = a.wake_us;
+            continue;
+        }
+        if ((a.out[5] & OTA_FLAG_TYPE_MASK) == OTA_TYPE_BEACON && as.abs_hop < 20) {
+            unsigned h = (unsigned)as.abs_hop;
+            if (++beacons[h] == 2 && now < as.hop_start_us + c.hop_us / 2)
+                late_second = false;
+        }
+        now += a.airtime_us + c.phy.tx_gap_us;
+    }
+    for (int h = 0; h < 20; h++)
+        CHECK(beacons[h] == 2);
+    CHECK(late_second); // the second one never comes before mid-hop
+}
+
 int main(void) {
     T_RUN(test_airtime);
     T_RUN(test_schedule_rules);
     T_RUN(test_queue_full);
+    T_RUN(test_two_beacons_per_hop);
     T_RUN(test_print_capacity);
     T_DONE();
 }

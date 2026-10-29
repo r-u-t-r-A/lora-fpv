@@ -1,0 +1,10 @@
+# air with the LR2021 radio (target), air_sim with the simulated ether (host).
+add_executable(air_sim src/air.c)
+target_compile_options(air_sim PRIVATE ${OLV_WARNINGS})
+target_link_libraries(air_sim PRIVATE olv_radio_sim olv_common m)
+if(OLV_RADIO)
+    add_executable(air src/air.c)
+    target_compile_options(air PRIVATE ${OLV_WARNINGS})
+    target_link_libraries(air PRIVATE olv_radio olv_common m)
+    set_target_properties(air PROPERTIES LINKER_LANGUAGE CXX)
+endif()

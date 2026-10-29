@@ -36,6 +36,21 @@ with libx265 on the PATH.
 Prints link budget, per-receiver PER, picture quality against a lossless
 decode, and the M2 gate; `--mp4` writes a side-by-side comparison.
 
+## Real-time link on one PC
+
+`air_sim` and `vrxd_sim` are the real air and VRX programs with a simulated
+radio (UDP multicast on loopback; `OLV_SIM_CHANNEL=loss=0.2` per receiver):
+
+```sh
+./build/air/air_sim --source build/m2_lr520/reference.ivf --loop &
+OLV_SIM_CHANNEL=loss=0.2,seed=1 ./build/vrx/vrxd_sim --radio --port 8081 --listen 127.0.0.1 &
+curl 127.0.0.1:8081/api/stats          # sync state, lock time, PER per channel
+python3 sim/m1_link.py build build/m2_lr520/reference.ivf   # M1 gate
+```
+
+On the boards the same programs are built as `air` and `vrxd` (LR2021 via
+RadioLib); wiring comes from `/etc/olv-radio.conf` (`common/radio_conf.h`).
+
 ## Web GUI
 
 ```sh

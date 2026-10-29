@@ -20,6 +20,7 @@
 #include "fhss.h"
 #include "h265.h"
 #include "ivf.h"
+#include "modes.h"
 #include "ota.h"
 #include "vpkt.h"
 #include "vrx_proto.h"
@@ -50,27 +51,11 @@ struct receiver {
     double first_lock_s;
 };
 
-struct mode_def {
-    const char *name;
-    enum ota_mode mode;
-    uint32_t bitrate;
-    uint8_t n_channels;
-    int w, h, fps;
-    double refresh_s;
-};
-
-static const struct mode_def modes[] = {
-    {"lr520", OTA_MODE_LR_520, 520000, 10, 640, 360, 30, 1.0},
-    {"lr260", OTA_MODE_LR_260, 260000, 10, 640, 360, 30, 2.0},
-    {"hq2600", OTA_MODE_HQ_2600, 2600000, 40, 1280, 720, 60, 0.5},
-    {"hq1300", OTA_MODE_HQ_1300, 1300000, 40, 1280, 720, 30, 0.5},
-};
-
 struct opts {
     const char *input;
     const char *out_dir;
     const char *bind;
-    const struct mode_def *mode;
+    const struct olv_mode *mode;
     int w, h, fps;
     double seconds;
     double refresh_s;
@@ -101,7 +86,7 @@ static void usage(void) {
             "  --k N --n N         FEC shape (default 8/12)\n"
             "  --shard N           shard payload bytes (default: best fit per hop)\n"
             "  --min-shard N       smaller blocks use fewer shards below this (default: shard)\n"
-            "  --cr 2|3|4          FLRC coding rate 1/2, 3/4, 1 (default 3)\n"
+            "  --cr 2|3|4|5        FLRC coding rate 1/2, 3/4, 1, 2/3 (default: mode)\n"
             "  --rx SPEC           add a receiver (repeatable, max %d); default two of\n"
             "                      'loss=0.2'. SPEC keys: loss=P burst=PGB/PBG burstloss=P\n"
             "                      bad=CH:P[+CH:P] outage=T0-T1 seed=N\n"
@@ -330,12 +315,11 @@ static void enqueue_pkt(void *ctx, const uint8_t *pkt, size_t len) {
 int main(int argc, char **argv) {
     struct opts o = {.out_dir = "sim_out",
                      .bind = "open-lr-video",
-                     .mode = &modes[0],
+                     .mode = &OLV_MODES[0],
                      .seconds = 10,
                      .qpmin = 20,
                      .k = 8,
                      .n = 12,
-                     .cr = 3,
                      .good_db = 30};
     int w = 0, h = 0, fps = 0;
     double refresh = 0;
@@ -387,11 +371,7 @@ int main(int argc, char **argv) {
     while ((c = getopt_long(argc, argv, "h", lo, NULL)) != -1) {
         switch (c) {
         case O_MODE:
-            o.mode = NULL;
-            for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++)
-                if (!strcmp(optarg, modes[i].name))
-                    o.mode = &modes[i];
-            if (!o.mode) {
+            if (!(o.mode = olv_mode_find(optarg))) {
                 fprintf(stderr, "unknown mode %s\n", optarg);
                 return 2;
             }
@@ -469,6 +449,8 @@ int main(int argc, char **argv) {
     o.h = h ? h : o.mode->h;
     o.fps = fps ? fps : o.mode->fps;
     o.refresh_s = refresh > 0 ? refresh : o.mode->refresh_s;
+    if (!o.cr)
+        o.cr = o.mode->cr;
     if (o.n_rx == 0) {
         o.rx_spec[0] = "loss=0.2,seed=1";
         o.rx_spec[1] = "loss=0.2,seed=2";
@@ -478,7 +460,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "paths must not contain single quotes\n");
         return 2;
     }
-    if (o.k < 1 || o.n < o.k || o.n > FEC_MAX_N || o.cr < 2 || o.cr > 4 || o.fps < 1 ||
+    if (o.k < 1 || o.n < o.k || o.n > FEC_MAX_N || o.cr < 2 || o.cr > 5 || o.fps < 1 ||
         o.seconds * o.fps >= MAX_FRAMES) {
         fprintf(stderr, "invalid FEC, coding rate, fps or length\n");
         return 2;
@@ -491,12 +473,13 @@ int main(int argc, char **argv) {
     // ---- link budget
     uint32_t seed = fhss_seed(o.bind);
     uint16_t link_id = ota_link_id(o.bind);
-    struct airsched_cfg sc = {.phy = flrc_phy_default(o.mode->bitrate, (uint8_t)o.cr),
+    struct airsched_cfg sc = {.phy = flrc_phy_default(o.mode->bitrate_bps, (uint8_t)o.cr),
                               .hop_us = 10000,
                               .retune_us = 200,
                               .beacon_every = 1,
+                              .beacons_per_hop = o.mode->beacons_per_hop,
                               .seed = seed,
-                              .n_channels = o.mode->n_channels,
+                              .n_channels = o.mode->band.n,
                               .link_id = link_id,
                               .mode = (uint8_t)o.mode->mode,
                               .fec_k = (uint8_t)o.k,
@@ -531,11 +514,12 @@ int main(int argc, char **argv) {
         slices = 1;
 
     printf("== link: %s, FLRC %.2f Mbit/s CR %s, %u channels, 100 Hz hops\n", o.mode->name,
-           o.mode->bitrate / 1e6,
+           o.mode->bitrate_bps / 1e6,
            o.cr == 2   ? "1/2"
+           : o.cr == 5 ? "2/3"
            : o.cr == 3 ? "3/4"
                        : "1",
-           o.mode->n_channels);
+           o.mode->band.n);
     printf("   packet %zu B (shard %d B) x %u per hop -> %.0f kbit/s of shards, %.0f kbit/s "
            "video at RS %d/%d\n",
            (size_t)shard + OTA_HDR_LEN, shard, per_hop, shard_bps / 1000.0, video_cap_kbps, o.k,
@@ -589,10 +573,10 @@ int main(int argc, char **argv) {
             return 1;
         }
         vrxlog_write_header(R->log);
-        struct fhss_rx_cfg fc = fhss_rx_default_cfg(o.mode->n_channels, sc.hop_us);
+        struct fhss_rx_cfg fc = fhss_rx_default_cfg(o.mode->band.n, sc.hop_us);
         R->clock_off = 0x10000000u * (uint32_t)r + 12345u;
         fhss_rx_init(&R->sync, seed, &fc, R->clock_off);
-        R->sync.park_ch = (uint8_t)((r * 3) % o.mode->n_channels);
+        R->sync.park_ch = (uint8_t)((r * 3) % o.mode->band.n);
         R->first_lock_s = -1;
     }
 
@@ -723,7 +707,7 @@ int main(int argc, char **argv) {
                r + 1, o.rx_spec[r], R->heard, total, total ? 100.0 * R->heard / total : 0, R->lost,
                R->off_channel, R->first_lock_s * 1000, R->sync.locks);
         printf("   PER by channel:");
-        for (int ch = 0; ch < o.mode->n_channels; ch++)
+        for (int ch = 0; ch < o.mode->band.n; ch++)
             printf(" %d:%.0f%%", ch,
                    R->ch_sent[ch] ? 100.0 * (1.0 - (double)R->ch_ok[ch] / R->ch_sent[ch]) : 0.0);
         printf("\n");

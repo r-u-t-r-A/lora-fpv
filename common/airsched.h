@@ -23,9 +23,10 @@ extern "C" {
 struct airsched_cfg {
     struct flrc_phy phy;
     uint32_t hop_us;
-    uint16_t retune_us;   // UNMEASURED: from hop start until the radio can transmit
-    uint8_t beacon_every; // beacon every N hops (1 = every hop, 0 = never)
-    uint32_t seed;        // fhss_seed(bind phrase)
+    uint16_t retune_us;      // UNMEASURED: from hop start until the radio can transmit
+    uint8_t beacon_every;    // beacon every N hops (1 = every hop, 0 = never)
+    uint8_t beacons_per_hop; // 1, or 2 = a second beacon from mid-hop (faster acquisition)
+    uint32_t seed;           // fhss_seed(bind phrase)
     uint8_t n_channels;
     uint16_t link_id;
     uint8_t mode;
@@ -44,7 +45,7 @@ struct airsched {
     struct fhss_seq seq;
     uint64_t hop_start_us;
     uint64_t abs_hop;
-    bool beacon_done;
+    uint8_t beacons_sent; // in the current hop
     uint16_t ota_seq;
     uint16_t q_head, q_count;
     uint16_t q_len[AIRSCHED_QMAX];

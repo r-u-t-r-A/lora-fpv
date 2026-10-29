@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // VRX daemon: receives OTA packets and streams them to the browser GUI.
 // Backends:
+//   --radio         receive with the radio (vrxd: LR2021, vrxd_sim: simulated
+//                   ether, see sim/radio_sim.c), hop sync, per-channel stats
 //   --replay FILE   play a sim/loopback packet log in real time (laptop GUI work)
-//   (radio)         LR2021 via common/radio.h: not built yet (M0/M1)
 #define _POSIX_C_SOURCE 200809L
 
 #include <getopt.h>
@@ -16,7 +17,10 @@
 #include "fhss.h"
 #include "httpd.h"
 #include "olv_util.h"
+#include "modes.h"
 #include "ota.h"
+#include "radio_conf.h"
+#include "rxlink.h"
 #include "vrx_proto.h"
 #include "vrxlog.h"
 
@@ -41,6 +45,7 @@ struct vrxd {
     const char *conf_path;
     struct httpd *http;
     struct replay rp;
+    struct rxlink *link; // radio backend, NULL in replay mode
     struct vrx_status st;
     uint64_t start_us;
 };
@@ -154,6 +159,14 @@ static int api(void *ctx, const char *method, const char *path, const char *body
                char *resp, size_t cap) {
     struct vrxd *d = ctx;
     (void)body_len;
+    if (!strcmp(path, "/api/stats")) {
+        if (!d->link) {
+            snprintf(resp, cap, "{\"error\":\"no radio in replay mode\"}");
+            return 404;
+        }
+        rxlink_stats_json(d->link, resp, cap);
+        return 200;
+    }
     if (strcmp(path, "/api/config") != 0) {
         snprintf(resp, cap, "{\"error\":\"unknown endpoint\"}");
         return 404;
@@ -179,7 +192,7 @@ static int api(void *ctx, const char *method, const char *path, const char *body
             snprintf(resp, cap, "{\"error\":\"could not save config\"}");
             return 500;
         }
-        // The radio backend re-reads this on its next acquisition cycle.
+        // Takes effect when vrxd restarts (the radio is set up from it at start).
     }
     char bind[160];
     json_escape(d->conf.bind, bind, sizeof(bind));
@@ -266,7 +279,17 @@ static void replay_step(struct vrxd *d, uint64_t now) {
 static void send_status(struct vrxd *d, uint64_t now) {
     d->st.vrx_id = (uint8_t)d->conf.id;
     d->st.band = strcmp(d->conf.band, "2400") == 0;
-    d->st.sync_state = d->rp.data ? FHSS_RX_LOCKED : FHSS_RX_PARKED;
+    if (d->link) {
+        const struct rxlink *l = d->link;
+        d->st.sync_state = (uint8_t)l->sync.state;
+        d->st.hop = l->sync.hop;
+        d->st.cycle = l->sync.cycle;
+        d->st.pkts_ok = l->pkts_ok;
+        d->st.pkts_crc = l->pkts_crc;
+        d->st.locks = (uint16_t)l->sync.locks;
+    } else {
+        d->st.sync_state = FHSS_RX_LOCKED;
+    }
     d->st.pkts_drop = httpd_ws_dropped(d->http);
     d->st.noise_dbm = INT16_MIN;
     d->st.uptime_ms = (uint32_t)((now - d->start_us) / 1000u);
@@ -276,21 +299,38 @@ static void send_status(struct vrxd *d, uint64_t now) {
     httpd_ws_broadcast(d->http, msg, n);
 }
 
+static void emit_ws(void *ctx, const uint8_t *msg, size_t len) {
+    httpd_ws_broadcast(ctx, msg, len);
+}
+
 static void usage(void) {
     fprintf(stderr, "usage: vrxd [--config /etc/vrx.conf] [--listen ADDR] [--port 8080]\n"
-                    "            [--www DIR] [--id N] [--replay FILE [--loop] [--speed X]]\n");
+                    "            [--www DIR] [--id N]\n"
+                    "            --radio [--radio-conf " RADIO_CONF_PATH "] [--capture FILE]\n"
+                    "          | --replay FILE [--loop] [--speed X]\n");
 }
 
 int main(int argc, char **argv) {
     static struct vrxd d;
     conf_defaults(&d.conf);
     const char *listen_addr = NULL, *www = NULL, *replay_path = NULL;
+    const char *radio_conf = RADIO_CONF_PATH, *capture = NULL;
+    bool use_radio = false;
     int port = 8080, id = 0;
     d.rp.speed = 1.0;
-    static const struct option lo[] = {
-        {"config", 1, 0, 'c'}, {"listen", 1, 0, 'l'}, {"port", 1, 0, 'p'}, {"www", 1, 0, 'w'},
-        {"id", 1, 0, 'i'},     {"replay", 1, 0, 'r'}, {"loop", 0, 0, 'L'}, {"speed", 1, 0, 's'},
-        {"help", 0, 0, 'h'},   {0, 0, 0, 0}};
+    static const struct option lo[] = {{"config", 1, 0, 'c'},
+                                       {"listen", 1, 0, 'l'},
+                                       {"port", 1, 0, 'p'},
+                                       {"www", 1, 0, 'w'},
+                                       {"id", 1, 0, 'i'},
+                                       {"replay", 1, 0, 'r'},
+                                       {"loop", 0, 0, 'L'},
+                                       {"speed", 1, 0, 's'},
+                                       {"radio", 0, 0, 'R'},
+                                       {"radio-conf", 1, 0, 'C'},
+                                       {"capture", 1, 0, 'P'},
+                                       {"help", 0, 0, 'h'},
+                                       {0, 0, 0, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "c:l:p:w:i:r:Ls:h", lo, NULL)) != -1) {
         switch (c) {
@@ -318,6 +358,15 @@ int main(int argc, char **argv) {
         case 's':
             d.rp.speed = atof(optarg);
             break;
+        case 'R':
+            use_radio = true;
+            break;
+        case 'C':
+            radio_conf = optarg;
+            break;
+        case 'P':
+            capture = optarg;
+            break;
         default:
             usage();
             return c == 'h' ? 0 : 2;
@@ -329,12 +378,32 @@ int main(int argc, char **argv) {
         d.conf.id = id;
     if (d.rp.speed <= 0)
         d.rp.speed = 1.0;
-    if (!replay_path) {
-        fprintf(stderr, "vrxd: the LR2021 radio backend is not built yet; use --replay\n");
+    static struct rxlink link;
+    if (use_radio == (replay_path != NULL)) {
+        usage();
         return 2;
     }
-    if (replay_open(&d.rp, replay_path))
+    if (replay_path && replay_open(&d.rp, replay_path))
         return 1;
+    if (use_radio) {
+        const struct olv_mode *mode = olv_mode_find(d.conf.mode);
+        struct radio_pins pins;
+        struct radio_flrc flrc;
+        if (!mode || radio_conf_load(radio_conf, &pins, &flrc) < 0)
+            return 2;
+        flrc.cr = 0; // the mode's default
+        if (rxlink_open(&link, mode, d.conf.bind, &pins, &flrc))
+            return 1;
+        if (capture) {
+            link.capture = fopen(capture, "wb");
+            if (!link.capture) {
+                perror(capture);
+                return 1;
+            }
+            vrxlog_write_header(link.capture);
+        }
+        d.link = &link;
+    }
 
     struct httpd_cfg hc = {
         .bind_addr = listen_addr, .port = (uint16_t)port, .www_root = www, .api = api, .ctx = &d};
@@ -343,17 +412,29 @@ int main(int argc, char **argv) {
         return 1;
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "vrxd %d: ws://%s:%d/rx, replaying %s%s\n", d.conf.id,
-            listen_addr ? listen_addr : "0.0.0.0", port, replay_path, d.rp.loop ? " (loop)" : "");
+    if (d.link)
+        fprintf(stderr, "vrxd %d: ws://%s:%d/rx, radio %s, bind \"%s\"\n", d.conf.id,
+                listen_addr ? listen_addr : "0.0.0.0", port, d.conf.mode, d.conf.bind);
+    else
+        fprintf(stderr, "vrxd %d: ws://%s:%d/rx, replaying %s%s\n", d.conf.id,
+                listen_addr ? listen_addr : "0.0.0.0", port, replay_path,
+                d.rp.loop ? " (loop)" : "");
 
     d.start_us = now_us();
     uint64_t next_status = d.start_us;
     while (!stop) {
-        if (httpd_poll(d.http, 2) < 0)
-            break;
+        if (d.link) {
+            // Radio first: it bounds its own wait by the next hop boundary.
+            rxlink_step(d.link, 2000, emit_ws, d.http);
+            if (httpd_poll(d.http, 0) < 0)
+                break;
+        } else {
+            if (httpd_poll(d.http, 2) < 0)
+                break;
+        }
         uint64_t now = now_us();
         // Do not burn through the log while nobody is watching.
-        if (httpd_ws_clients(d.http))
+        if (!d.link && httpd_ws_clients(d.http))
             replay_step(&d, now);
         else
             d.rp.t0_wall = 0;
@@ -361,6 +442,14 @@ int main(int argc, char **argv) {
             send_status(&d, now);
             next_status = now + 250000u;
         }
+    }
+    if (d.link) {
+        char js[8192];
+        rxlink_stats_json(d.link, js, sizeof(js));
+        fprintf(stderr, "vrxd %d: %s\n", d.conf.id, js);
+        if (d.link->capture)
+            fclose(d.link->capture);
+        rxlink_close(d.link);
     }
     httpd_close(d.http);
     free(d.rp.data);
