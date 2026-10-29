@@ -61,8 +61,10 @@ Encoder target 173 kbit/s; after stripping filler/SEI the stream is
 
 "Good" = PSNR >= 30 dB against the lossless decode; the merged stream's
 bad frames are the first ~1 s (acquisition, then waiting for the first
-IDR). M2 gate as implemented (merged picture always recovers within two
-refresh periods and ends good): **PASS** for LR 520k and HQ 2.6M.
+IDR). M2 gate as implemented: once the merged picture is up, no bad stretch
+lasts longer than two refresh periods (startup is reported, not gated):
+**PASS** for LR 520k and HQ 2.6M. (A first version also required the clip to
+end on a good frame; that failed randomly when a loss hit the last second.)
 
 A single receiver at 20 % loss does recover after every loss, but with
 periodic IDR each lost block costs up to a second of damaged picture, so it

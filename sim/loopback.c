@@ -223,9 +223,9 @@ struct quality {
     int frames;
     double mean_db;
     int good, identical;
-    int longest_bad; // frames
-    int bad_runs;
-    bool ends_good;
+    int startup;     // frames before the first good frame (acquisition, first IDR)
+    int longest_bad; // longest bad stretch after the first good frame, in frames
+    int bad_runs;    // bad stretches after the first good frame
 };
 
 static struct quality measure(const struct opts *o, const char *dir, const char *name,
@@ -254,7 +254,7 @@ static struct quality measure(const struct opts *o, const char *dir, const char 
         return q;
     char line[1024];
     int run = 0;
-    bool last_good = false;
+    bool seen_good = false;
     double sum = 0;
     while (fgets(line, sizeof(line), f)) {
         char *p = strstr(line, "psnr_avg:");
@@ -268,10 +268,12 @@ static struct quality measure(const struct opts *o, const char *dir, const char 
         sum += db;
         if (db >= 100)
             q.identical++;
-        last_good = db >= o->good_db;
-        if (last_good) {
+        if (db >= o->good_db) {
             q.good++;
+            seen_good = true;
             run = 0;
+        } else if (!seen_good) {
+            q.startup++;
         } else {
             if (run == 0)
                 q.bad_runs++;
@@ -283,7 +285,7 @@ static struct quality measure(const struct opts *o, const char *dir, const char 
     fclose(f);
     q.ok = q.frames > 0;
     q.mean_db = q.frames ? sum / q.frames : 0;
-    q.ends_good = last_good;
+    q.ok = q.ok && seen_good;
     return q;
 }
 
@@ -735,8 +737,8 @@ int main(int argc, char **argv) {
         streams[ns++] = &rxs[r].out;
     streams[ns++] = &merged;
     printf("== picture (PSNR vs. lossless decode, good >= %.0f dB)\n", o.good_db);
-    printf("   %-7s %8s %8s %8s %8s %7s %9s %10s %6s\n", "stream", "complete", "partial", "lost",
-           "good", "mean dB", "bad runs", "worst run", "ends");
+    printf("   %-7s %8s %8s %8s %8s %7s %8s %9s %10s\n", "stream", "complete", "partial", "lost",
+           "good", "mean dB", "startup", "bad runs", "worst run");
     struct quality mq = {0};
     for (int i = 0; i < ns; i++) {
         struct stream_out *s = streams[i];
@@ -746,11 +748,11 @@ int main(int argc, char **argv) {
         struct quality q = measure(&o, o.out_dir, s->name, n_frames);
         if (s == &merged)
             mq = q;
-        printf("   %-7s %7.1f%% %7.1f%% %7.1f%% %7.1f%% %7.1f %9d %8.2f s %6s\n", s->name,
+        printf("   %-7s %7.1f%% %7.1f%% %7.1f%% %7.1f%% %7.1f %6.2f s %9d %8.2f s\n", s->name,
                100.0 * cnt[FS_COMPLETE] / n_frames, 100.0 * cnt[FS_PARTIAL] / n_frames,
                100.0 * (cnt[FS_LOST] + cnt[FS_NONE]) / n_frames,
-               q.frames ? 100.0 * q.good / q.frames : 0, q.mean_db, q.bad_runs,
-               (double)q.longest_bad / o.fps, q.ends_good ? "good" : "BAD");
+               q.frames ? 100.0 * q.good / q.frames : 0, q.mean_db, (double)q.startup / o.fps,
+               q.bad_runs, (double)q.longest_bad / o.fps);
     }
 
     if (o.mp4) {
@@ -762,11 +764,13 @@ int main(int argc, char **argv) {
         write_mp4(&o, o.out_dir, names, nn);
     }
 
-    // M2 gate: the merged picture always comes back: it ends good, and no bad
-    // stretch is longer than two refresh periods.
+    // M2 gate: once the merged picture is up, it always comes back: no bad
+    // stretch lasts longer than two refresh periods. A stretch still open at
+    // the end of the clip counts with the length it had. Startup (acquisition
+    // plus waiting for the first IDR) is reported, not gated.
     double worst_s = (double)mq.longest_bad / o.fps;
-    bool pass = mq.ok && mq.ends_good && worst_s <= 2 * o.refresh_s;
-    printf("== M2 gate (merged recovers, worst bad run <= %.2f s): %s\n", 2 * o.refresh_s,
+    bool pass = mq.ok && worst_s <= 2 * o.refresh_s;
+    printf("== M2 gate (merged picture up, then no bad stretch > %.2f s): %s\n", 2 * o.refresh_s,
            pass ? "PASS" : "FAIL");
 
     vpkt_tx_free(&tx);

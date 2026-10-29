@@ -13,6 +13,6 @@ if(FFMPEG)
     add_test(NAME m2_gate_lr520
              COMMAND loopback --mode lr520 --seconds 6 --gate --out ${CMAKE_BINARY_DIR}/m2_lr520)
     add_test(NAME m2_gate_hq2600
-             COMMAND loopback --mode hq2600 --seconds 4 --gate --out ${CMAKE_BINARY_DIR}/m2_hq2600)
+             COMMAND loopback --mode hq2600 --seconds 6 --gate --out ${CMAKE_BINARY_DIR}/m2_hq2600)
     set_tests_properties(m2_gate_lr520 m2_gate_hq2600 PROPERTIES LABELS sim TIMEOUT 300)
 endif()
