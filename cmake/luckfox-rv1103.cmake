@@ -15,6 +15,9 @@ if(NOT LUCKFOX_SDK)
     message(FATAL_ERROR "set LUCKFOX_SDK to the luckfox-pico SDK checkout")
 endif()
 set(LUCKFOX_SDK ${LUCKFOX_SDK} CACHE PATH "luckfox-pico SDK" FORCE)
+# CMake re-reads this file in its compiler-check projects; pass the SDK on.
+set(ENV{LUCKFOX_SDK} ${LUCKFOX_SDK})
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES LUCKFOX_SDK)
 
 set(_tc ${LUCKFOX_SDK}/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf)
 set(_prefix ${_tc}/bin/arm-rockchip830-linux-uclibcgnueabihf-)
@@ -24,6 +27,9 @@ set(CMAKE_SYSROOT ${_tc}/arm-rockchip830-linux-uclibcgnueabihf/sysroot)
 
 set(CMAKE_C_FLAGS_INIT "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
 set(CMAKE_CXX_FLAGS_INIT "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
+# The stock rootfs need not carry libstdc++: link the C++ runtime (RadioLib
+# backend) statically.
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-static-libstdc++ -static-libgcc")
 
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)

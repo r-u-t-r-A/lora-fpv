@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Chip capabilities, module presets and which link modes each chip can run.
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700 // mkstemp (uClibc hides it under plain POSIX)
 #include "modes.h"
 #include "radio.h"
 #include "radio_conf.h"

@@ -306,7 +306,10 @@ struct httpd *httpd_open(const struct httpd_cfg *cfg) {
     h->lfd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(h->lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(cfg->port)};
+    struct sockaddr_in a; // (no designated initializer: GCC 8 warns about the rest)
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(cfg->port);
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     if (cfg->bind_addr && inet_pton(AF_INET, cfg->bind_addr, &a.sin_addr) != 1) {
         fprintf(stderr, "httpd: bad bind address %s\n", cfg->bind_addr);

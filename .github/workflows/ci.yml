@@ -26,6 +26,38 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # Target build with the luckfox-pico SDK toolchain (GCC 8.3, uClibc,
+  # Linux 5.10 headers), unit tests run on ARM under qemu-user.
+  rv1103:
+    runs-on: ubuntu-24.04
+    env:
+      TC: luckfox-sdk/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/cache@v4
+        id: sdk
+        with:
+          path: luckfox-sdk
+          key: luckfox-toolchain-v1
+      - name: Fetch the SDK toolchain only (sparse checkout)
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/LuckfoxTECH/luckfox-pico.git luckfox-sdk
+          git -C luckfox-sdk sparse-checkout set tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build qemu-user
+      - name: Configure
+        run: >
+          cmake -S . -B build-rv1103 -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=cmake/luckfox-rv1103.cmake -DLUCKFOX_SDK=$PWD/luckfox-sdk
+          "-DCMAKE_CROSSCOMPILING_EMULATOR=qemu-arm;-L;$PWD/$TC/arm-rockchip830-linux-uclibcgnueabihf/sysroot"
+      - name: Build
+        run: ninja -C build-rv1103
+      - name: Unit tests (ARM, qemu-user)
+        run: ctest --test-dir build-rv1103 --output-on-failure -E "^m[12]_"
+
   web:
     runs-on: ubuntu-24.04
     steps:

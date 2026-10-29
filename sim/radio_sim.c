@@ -114,7 +114,10 @@ struct radio *radio_open(const struct radio_pins *pins, const struct radio_flrc 
     int one = 1;
     setsockopt(r->sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     setsockopt(r->sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    struct sockaddr_in a; // (no designated initializer: GCC 8 warns about the rest)
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     struct ip_mreq m;
     m.imr_multiaddr.s_addr = inet_addr(ether);
@@ -131,7 +134,9 @@ struct radio *radio_open(const struct radio_pins *pins, const struct radio_flrc 
         free(r);
         return NULL;
     }
-    r->group = (struct sockaddr_in){.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    memset(&r->group, 0, sizeof(r->group));
+    r->group.sin_family = AF_INET;
+    r->group.sin_port = htons((uint16_t)port);
     r->group.sin_addr.s_addr = inet_addr(ether);
 
     uint32_t seed = radio_now_us() ^ ((uint32_t)getpid() << 16);
