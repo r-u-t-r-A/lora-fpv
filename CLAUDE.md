@@ -72,7 +72,8 @@ MAVLink OSD.
 common/          shared C: ota.h, vrx_proto.h, fhss, fec, h265, vpkt (packetizer/reassembler), radio.h
 third_party/     zfex (vendored), RadioLib (git submodule), libde265 (submodule)
 radio/           LR2021 + SX1280 backends for the RV1103: RadioLib + Linux spidev/GPIO HAL (C++ shim)
-air/             air-unit app for RV1103: capture -> encode -> slice -> FEC -> hop clock -> radio
+air/             air-unit app for RV1103: capture -> encode -> slice -> FEC -> hop clock -> radio;
+                 olv-cam (camera -> H.265 via Rockchip MPI) runs as its child
 vrx/             VRX daemon for RV1103: radio + RX hop sync -> WebSocket; static HTTP; config REST; usb-gadget scripts
 web/             Chrome GUI (TypeScript + WASM FEC + WebCodecs + OSD)
 sim/             PC-only tools: lossy channel simulator, packet replay, loopback pipeline
@@ -84,9 +85,10 @@ hardware/        wiring diagrams now, KiCad carrier boards later
 
 Everything in `common/`, `air/` (except the MPI glue) and `vrx/` must also build
 for the x86-64 Linux host, so the whole chain can be tested in `sim/` without
-hardware. Keep Rockchip-specific code behind a small interface
-(`air/src/enc_rk.c` vs `air/src/enc_sw.c` using a file or v4l2 source + x265
-for host builds).
+hardware. Rockchip-specific code is one program, `air/src/olv_cam.c`
+(`olv-cam`, built only against the SDK's media libraries). It writes an IVF
+stream that `olv-air --source camera` reads from a pipe. On the host,
+`sim/fake_cam.py` stands in for it.
 
 ## Protocol
 
@@ -187,6 +189,14 @@ start or mode change), SPS/PPS/VPS repeated every 1 s, column intra refresh,
 slices sized to one FEC block, no B-frames, 1 reference frame. First thing to
 verify in M2: that the RV1103 MPI exposes column intra refresh and slice
 control. If not, fall back to row refresh, then to short GOPs.
+- The API has both (`VENC_INTRA_REFRESH_S` with `INTRA_REFRESH_COLUMN`,
+  `VENC_SLICE_SPLIT_S` by bytes), and `olv-cam` uses them.
+- What the hardware does with them is still to be measured
+  (docs/camera.md, bench steps).
+- Cameras (changed 2026-10-30): the Luckfox MIPI sensors with SDK drivers
+  and IQ files (SC3336, SC4336, SC530AI). The ESP32 DVP cameras (OV2640,
+  OV3660) cannot connect. OV5640 needs a driver patch and was dropped.
+  None of these sensors does 60 fps, so hq2600 runs at 30 fps.
 
 ## Milestones and exit gates
 

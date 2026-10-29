@@ -40,12 +40,16 @@ jobs:
         id: sdk
         with:
           path: luckfox-sdk
-          key: luckfox-toolchain-v1
-      - name: Fetch the SDK toolchain only (sparse checkout)
+          key: luckfox-toolchain-v2
+      - name: Fetch the SDK toolchain and camera libraries only (sparse checkout)
         if: steps.sdk.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --filter=blob:none --sparse https://github.com/LuckfoxTECH/luckfox-pico.git luckfox-sdk
-          git -C luckfox-sdk sparse-checkout set tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf
+          aiq=media/isp/release_camera_engine_rkaiq_rv1106_arm-rockchip830-linux-uclibcgnueabihf
+          git -C luckfox-sdk sparse-checkout set --no-cone \
+            /tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/ \
+            /media/rockit/rockit/mpi/sdk/include/ /media/rockit/rockit/lib/lib32/librockit.so \
+            /$aiq/include/ /$aiq/lib/librkaiq.so
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build qemu-user
       - name: Configure
@@ -54,7 +58,7 @@ jobs:
           -DCMAKE_TOOLCHAIN_FILE=cmake/luckfox-rv1103.cmake -DLUCKFOX_SDK=$PWD/luckfox-sdk
           "-DCMAKE_CROSSCOMPILING_EMULATOR=qemu-arm;-L;$PWD/$TC/arm-rockchip830-linux-uclibcgnueabihf/sysroot"
       - name: Build
-        run: ninja -C build-rv1103
+        run: ninja -C build-rv1103 && test -x build-rv1103/air/olv-cam
       - name: Unit tests (ARM, qemu-user)
         run: ctest --test-dir build-rv1103 --output-on-failure -E "^m[12]_"
 
