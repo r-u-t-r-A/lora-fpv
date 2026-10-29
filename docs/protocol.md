@@ -50,7 +50,7 @@ start on the receiver's clock.
 ## 2. Video framing and FEC
 
 One H.265 access unit (Annex B) is one frame. Before packetizing, the air app
-removes AUD and SEI NALs and, every second, prepends the cached VPS/SPS/PPS if
+removes AUD, SEI and filler-data NALs and, every second, prepends the cached VPS/SPS/PPS if
 the frame has none (`h265_prepare_au`).
 
 The frame is cut into chunks, at NAL boundaries where possible (the last NAL

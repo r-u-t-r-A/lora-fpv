@@ -20,6 +20,7 @@ enum {
     H265_NAL_SPS = 33,
     H265_NAL_PPS = 34,
     H265_NAL_AUD = 35,
+    H265_NAL_FD = 38, // filler data (CBR padding)
     H265_NAL_SEI_PREFIX = 39,
     H265_NAL_SEI_SUFFIX = 40,
 };
@@ -48,8 +49,9 @@ bool h265_first_slice(const uint8_t *buf, const struct h265_nal *nal);
 typedef void (*h265_au_cb)(void *ctx, const uint8_t *au, size_t len);
 void h265_split_aus(const uint8_t *buf, size_t len, h265_au_cb cb, void *ctx);
 
-// Rewrites one AU for transmission: drops AUD and SEI NALs (the frame number
-// in the OTA header marks frame boundaries), and, when the AU has no VPS/SPS/
+// Rewrites one AU for transmission: drops AUD, filler and SEI NALs (the frame
+// number in the OTA header marks frame boundaries; filler only wastes airtime),
+// and, when the AU has no VPS/SPS/
 // PPS and repeat is set, prepends the cached ones. Caches parameter sets it
 // sees. Returns the output length, or 0 if out_cap is too small.
 #define H265_PS_MAX 256

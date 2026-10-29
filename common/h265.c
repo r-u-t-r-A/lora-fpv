@@ -115,8 +115,8 @@ size_t h265_prepare_au(struct h265_ps_cache *ps, const uint8_t *au, size_t len, 
     }
     pos = 0;
     while (h265_next_nal(au, len, &pos, &nal)) {
-        if (nal.type == H265_NAL_AUD || nal.type == H265_NAL_SEI_PREFIX ||
-            nal.type == H265_NAL_SEI_SUFFIX)
+        if (nal.type == H265_NAL_AUD || nal.type == H265_NAL_FD ||
+            nal.type == H265_NAL_SEI_PREFIX || nal.type == H265_NAL_SEI_SUFFIX)
             continue;
         if (!append(out, out_cap, &n, start_code, 4) ||
             !append(out, out_cap, &n, au + nal.data, nal.end - nal.data))

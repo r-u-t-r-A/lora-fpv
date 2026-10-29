@@ -62,6 +62,7 @@ static void test_prepare_au(void) {
     n0 = fx_nal(au0, n0, H265_NAL_PPS, 6, false, &rng);
     n0 = fx_nal(au0, n0, H265_NAL_SEI_PREFIX, 40, false, &rng);
     n0 = fx_nal(au0, n0, H265_NAL_IDR_N_LP, 300, true, &rng);
+    n0 = fx_nal(au0, n0, H265_NAL_FD, 50, false, &rng);
     n1 = fx_nal(au1, n1, H265_NAL_AUD, 1, false, &rng);
     n1 = fx_nal(au1, n1, 1, 100, true, &rng);
 
@@ -69,7 +70,7 @@ static void test_prepare_au(void) {
     bool has_ps;
     size_t o = h265_prepare_au(&ps, au0, n0, true, out, sizeof(out), &has_ps);
     CHECK(has_ps);
-    CHECK(o == n0 - (4 + 3) - (4 + 42)); // AUD and SEI removed
+    CHECK(o == n0 - (4 + 3) - (4 + 42) - (4 + 52)); // AUD, SEI and filler removed
     CHECK(ps.vps_len == 22 && ps.sps_len == 32 && ps.pps_len == 8);
 
     o = h265_prepare_au(&ps, au1, n1, false, out, sizeof(out), &has_ps);
