@@ -78,6 +78,7 @@ web/             Chrome GUI (TypeScript + WASM FEC + WebCodecs + OSD)
 sim/             PC-only tools: lossy channel simulator, packet replay, loopback pipeline
 tools/           bench scripts: sensitivity sweeps, PER logging, plotting
 docs/            wiring, protocol spec, test reports
+firmware/        build-image.sh: stock luckfox-pico SDK image + our programs, boot scripts, config
 hardware/        wiring diagrams now, KiCad carrier boards later
 ```
 

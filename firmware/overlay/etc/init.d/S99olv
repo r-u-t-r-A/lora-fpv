@@ -1,0 +1,31 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# open-lr-video: air unit or VRX daemon, per /etc/olv.conf (role=air|vrx).
+# Runs after S99luckfoxconfigload, which enables SPI0 from /etc/luckfox.cfg.
+PIDFILE=/var/run/olv-run.pid
+
+case "$1" in
+start)
+    if grep -q '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*0' /etc/olv.conf 2>/dev/null; then
+        echo "olv: not started: enabled=0 in /etc/olv.conf (air: set 1 only with antenna/load fitted)"
+        exit 0
+    fi
+    echo "olv: starting"
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- /usr/bin/olv-run
+    ;;
+stop)
+    echo "olv: stopping"
+    start-stop-daemon -K -p "$PIDFILE" >/dev/null 2>&1
+    rm -f "$PIDFILE"
+    killall olv-air olv-vrxd 2>/dev/null
+    ;;
+restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+*)
+    echo "usage: $0 start|stop|restart"
+    exit 1
+    ;;
+esac

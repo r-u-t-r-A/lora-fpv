@@ -1,0 +1,60 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Runs the open-lr-video program for this board's role (/etc/olv.conf) and
+# restarts it whenever it exits. Started by /etc/init.d/S99olv.
+CONF=/etc/olv.conf
+LOG=/var/log/olv.log
+
+conf() { # conf KEY DEFAULT: value from /etc/olv.conf, comments and blanks stripped
+    v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=\([^#]*\).*/\1/p" "$CONF" 2>/dev/null | tail -n 1 |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$v" ] && echo "$v" || echo "$2"
+}
+
+log() { echo "$(date '+%F %T') olv-run: $*" >>"$LOG"; }
+
+# Keep the log small: /var/log is in RAM.
+trim_log() {
+    if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt 262144 ]; then
+        mv -f "$LOG" "$LOG.1"
+    fi
+}
+
+role=$(conf role vrx)
+radio_conf=$(conf radio_conf /etc/olv-radio.conf)
+spidev=$(sed -n 's/^[[:space:]]*spidev[[:space:]]*=\([^[:space:]#]*\).*/\1/p' "$radio_conf" 2>/dev/null | tail -n 1)
+spidev=${spidev:-/dev/spidev0.0}
+
+# SPI0 comes up from /etc/luckfox.cfg (S99luckfoxconfigload); give it time.
+n=0
+while [ ! -e "$spidev" ] && [ $n -lt 20 ]; do
+    sleep 0.5
+    n=$((n + 1))
+done
+[ -e "$spidev" ] || log "WARNING: $spidev missing (SPI0 not enabled? see /etc/luckfox.cfg)"
+
+case "$role" in
+air)
+    mode=$(conf mode hq1300)
+    source=$(conf source testcard)
+    [ "$source" = testcard ] && source=/usr/share/olv/testcard-$mode.ivf
+    set -- /usr/bin/olv-air --source "$source" --loop --mode "$mode" \
+        --bind "$(conf bind open-lr-video)" --radio-conf "$radio_conf" --rt $(conf air_args "")
+    ;;
+vrx)
+    set -- /usr/bin/olv-vrxd --radio --radio-conf "$radio_conf" --config /etc/vrx.conf \
+        --www /usr/share/olv/www --port 8080 $(conf vrx_args "")
+    ;;
+*)
+    log "unknown role '$role' in $CONF (air or vrx); not starting"
+    exit 1
+    ;;
+esac
+
+log "role $role: $*"
+while :; do
+    trim_log
+    "$@" >>"$LOG" 2>&1
+    log "exited with status $?, restarting in 2 s"
+    sleep 2
+done

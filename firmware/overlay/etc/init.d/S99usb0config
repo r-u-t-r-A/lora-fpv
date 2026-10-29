@@ -1,0 +1,91 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Replaces the stock Luckfox S99usb0config (same USB reconnect handling).
+# Every board would get 172.32.0.93 there, so two VRXs on one PC would
+# collide. Here a VRX takes 10.55.<id>.1/24 (<id> from /etc/vrx.conf) and,
+# if busybox has udhcpd, hands the PC 10.55.<id>.2. The air unit keeps the
+# stock address for maintenance.
+
+USB_KEYWORD="android_work: sent uevent USB_STATE="
+USB_MODE_PATH="/proc/device-tree/usbdrd/usb@ffb00000/dr_mode"
+MAX_RETRIES=10
+
+conf() { # conf FILE KEY DEFAULT
+    v=$(sed -n "s/^[[:space:]]*$2[[:space:]]*=\([^#]*\).*/\1/p" "$1" 2>/dev/null | tail -n 1 |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$v" ] && echo "$v" || echo "$3"
+}
+
+ROLE=$(conf /etc/olv.conf role vrx)
+if [ "$ROLE" = vrx ]; then
+    ID=$(conf /etc/vrx.conf id 1)
+    TARGET_IP="10.55.$ID.1"
+else
+    TARGET_IP="172.32.0.93"
+fi
+
+dhcp_start() {
+    [ "$ROLE" = vrx ] && command -v udhcpd >/dev/null 2>&1 || return 0
+    killall udhcpd 2>/dev/null
+    cat >/tmp/udhcpd-usb0.conf <<EOC
+start 10.55.$ID.2
+end 10.55.$ID.2
+max_leases 1
+interface usb0
+lease_file /tmp/udhcpd-usb0.leases
+option subnet 255.255.255.0
+option lease 86400
+EOC
+    # No router or DNS option: the PC keeps its own default route.
+    touch /tmp/udhcpd-usb0.leases
+    udhcpd /tmp/udhcpd-usb0.conf
+}
+
+usb0_config() {
+    if [ "$(cat $USB_MODE_PATH)" != "peripheral" ]; then
+        echo "usb0 is using host mode"
+        return
+    fi
+    retries=0
+    current_ip=$(ifconfig usb0 | grep -o 'inet addr:[^ ]*' | awk -F ':' '{print $2}')
+    while [ "$current_ip" != "$TARGET_IP" ] && [ $retries -lt $MAX_RETRIES ]; do
+        sleep .5
+        echo "olv: set usb0 ip $TARGET_IP"
+        ifconfig usb0 "$TARGET_IP" netmask 255.255.255.0
+        current_ip=$(ifconfig usb0 | grep -o 'inet addr:[^ ]*' | awk -F ':' '{print $2}')
+        retries=$((retries + 1))
+    done
+    if [ "$current_ip" != "$TARGET_IP" ]; then
+        echo "usb0 config error"
+    else
+        echo "usb0 config success ($TARGET_IP)"
+        dhcp_start
+    fi
+}
+
+usb_reset() {
+    while true; do
+        last_line=$(dmesg | grep "$USB_KEYWORD" | tail -n 1)
+        case "$last_line" in
+        *DISCONNECTED*)
+            echo "Detected USB DISCONNECTED."
+            /etc/init.d/S50usbdevice restart
+            usb0_config
+            ;;
+        esac
+        sleep 5
+    done
+}
+
+case $1 in
+start)
+    if [ "$(cat $USB_MODE_PATH)" = "peripheral" ]; then
+        usb0_config
+        usb_reset &
+    fi
+    ;;
+stop) ;;
+*)
+    exit 1
+    ;;
+esac

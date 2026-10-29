@@ -15,6 +15,12 @@ the numbers go into the report and into `common/airtime.h`.
 
 ## 1. Build
 
+Easiest: flash the firmware images from `firmware/build-image.sh` (see
+`firmware/README.md`). They contain `flrc_bench` and the radio conf; set
+`enabled=0` in `/etc/olv.conf` so nothing else uses the radio while you run
+the bench tool, and pass the pins from `/etc/olv-radio.conf`. To build just
+the tools instead:
+
 ```sh
 git submodule update --init third_party/RadioLib
 cmake -S . -B build-rv1103 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/luckfox-rv1103.cmake \
@@ -22,9 +28,9 @@ cmake -S . -B build-rv1103 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/luckfox-rv1103.
 ninja -C build-rv1103 flrc_bench vrxd
 ```
 
-If this fails with `GPIO_V2_GET_LINE_IOCTL` undeclared, the toolchain's
-kernel headers predate Linux 5.10: paste the error and I will add a fallback
-to the v1 GPIO API.
+(Checked 2026-10-29 with the SDK toolchain: GCC 8.3, uClibc, Linux 5.10.66
+headers with the GPIO v2 uAPI; CI cross-builds every commit and runs the
+unit tests on ARM under qemu.)
 
 ## 2. Board setup (each board)
 
